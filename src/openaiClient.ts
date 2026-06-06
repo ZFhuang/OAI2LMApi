@@ -15,12 +15,51 @@ export interface APIModelInfo {
     object: string;
     created?: number;
     owned_by?: string;
-    // Extended fields from some providers (e.g., OpenRouter)
+    name?: string;
+    display_name?: string;
+    description?: string;
+    canonical_slug?: string;
+    type?: string;
+    created_at?: string | number;
+    credits?: string;
+    credit_multiplier?: number;
+    vendor?: string;
+    maxInputTokens?: number;
+    maxOutputTokens?: number;
+    maxAllowedSize?: number;
+    supported_parameters?: string[];
+    default_parameters?: Record<string, unknown>;
+    architecture?: {
+        modality?: string;
+        input_modalities?: string[];
+        output_modalities?: string[];
+        tokenizer?: string | null;
+        instruct_type?: string | null;
+    };
+    top_provider?: {
+        context_length?: number;
+        max_completion_tokens?: number;
+        is_moderated?: boolean;
+    };
+    // Extended fields from some providers (e.g., OpenRouter and CodeBuddy-style gateways)
     context_length?: number;
     max_completion_tokens?: number;
+    supports_vision?: boolean;
+    supports_tools?: boolean;
+    supports_tool_use?: boolean;
+    supports_function_calling?: boolean;
+    supports_reasoning?: boolean;
+    supportsImages?: boolean;
+    supportsToolCall?: boolean;
+    supportsReasoning?: boolean;
+    disabledMultimodal?: boolean;
     capabilities?: {
         tool_calling?: boolean;
         vision?: boolean;
+        function_calling?: boolean;
+        tool_use?: boolean;
+        tools?: boolean;
+        reasoning?: boolean;
     };
 }
 
@@ -65,17 +104,58 @@ export interface ToolDefinition {
  */
 export type ToolChoice = 'none' | 'auto' | 'required' | { type: 'function'; function: { name: string } };
 
+export type ChatMessageContentPart =
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string; detail?: 'auto' | 'low' | 'high' } };
+
+export type ChatMessageContent = string | ChatMessageContentPart[] | null;
+
 export interface ChatMessage {
     role: 'system' | 'user' | 'assistant' | 'tool';
-    content: string | null;
+    content: ChatMessageContent;
     tool_calls?: ToolCall[];
     tool_call_id?: string;
+}
+
+export interface OpenAIUsage {
+    prompt_tokens: number;
+    completion_tokens: number;
+    total_tokens: number;
+    prompt_tokens_details?: {
+        cached_tokens: number;
+        cache_creation_tokens?: number;
+        cache_creation_input_tokens?: number;
+    };
+    completion_tokens_details?: {
+        reasoning_tokens: number;
+        accepted_prediction_tokens: number;
+        rejected_prediction_tokens: number;
+    };
+}
+
+export interface OpenAIResponseMetadata {
+    id?: string;
+    model?: string;
+    created?: number;
+    system_fingerprint?: string;
+    service_tier?: string;
+    finish_reason?: string;
+}
+
+export interface OpenAIRequestOptions {
+    temperature?: number;
+    topP?: number;
+    stop?: string | string[];
+    reasoning?: Record<string, unknown>;
+    includeReasoning?: boolean;
+    responseFormat?: Record<string, unknown>;
+    serviceTier?: string;
 }
 
 // Type-safe message format for OpenAI API
 interface OpenAIChatMessage {
     role: 'system' | 'user' | 'assistant' | 'tool';
-    content: string | null;
+    content: ChatMessageContent;
     tool_calls?: ToolCall[];
     tool_call_id?: string;
 }
@@ -408,12 +488,16 @@ export interface StreamOptions {
      */
     onToolCallsComplete?: (toolCalls: CompletedToolCall[]) => void;
     /** Called with token usage statistics after the API response completes. */
-    onUsage?: (usage: { promptTokens: number; completionTokens: number }) => void;
+    onUsage?: (usage: OpenAIUsage) => void;
+    /** Called with response metadata surfaced by OpenAI-compatible streaming chunks. */
+    onResponseMetadata?: (metadata: OpenAIResponseMetadata) => void;
     signal?: AbortSignal;
     tools?: ToolDefinition[];
     toolChoice?: ToolChoice;
     /** Optional max tokens for completion generation (mapped to OpenAI `max_tokens`). */
     maxTokens?: number;
+    /** Optional OpenAI-compatible request parameters derived from model metadata/options. */
+    requestOptions?: OpenAIRequestOptions;
     /**
      * When true, use the OpenAI Responses API instead of Chat Completions.
      */
@@ -440,6 +524,158 @@ export class OpenAIClient {
             return (value as string[]).join('');
         }
         return undefined;
+    }
+
+    private getRecord(value: unknown): Record<string, unknown> | undefined {
+        return typeof value === 'object' && value !== null
+            ? value as Record<string, unknown>
+            : undefined;
+    }
+
+    private getFiniteNumber(value: unknown): number | undefined {
+        return typeof value === 'number' && Number.isFinite(value)
+            ? value
+            : undefined;
+    }
+
+    private readNumber(value: unknown, key: string): number | undefined {
+        return this.getFiniteNumber(this.getRecord(value)?.[key]);
+    }
+
+    private buildPromptTokenDetails(value: unknown): OpenAIUsage['prompt_tokens_details'] | undefined {
+        const details = this.getRecord(value);
+        if (!details) {
+            return undefined;
+        }
+
+        const cachedTokens = this.getFiniteNumber(details['cached_tokens'])
+            ?? this.getFiniteNumber(details['cached_input_tokens'])
+            ?? 0;
+        const cacheCreationInputTokens = this.getFiniteNumber(details['cache_creation_input_tokens']);
+        const cacheCreationTokens = this.getFiniteNumber(details['cache_creation_tokens']);
+
+        return {
+            cached_tokens: cachedTokens,
+            ...(cacheCreationTokens !== undefined ? { cache_creation_tokens: cacheCreationTokens } : {}),
+            ...(cacheCreationInputTokens !== undefined ? { cache_creation_input_tokens: cacheCreationInputTokens } : {})
+        };
+    }
+
+    private buildCompletionTokenDetails(value: unknown): OpenAIUsage['completion_tokens_details'] | undefined {
+        const details = this.getRecord(value);
+        if (!details) {
+            return undefined;
+        }
+
+        const reasoningTokens = this.getFiniteNumber(details['reasoning_tokens']);
+        const acceptedPredictionTokens = this.getFiniteNumber(details['accepted_prediction_tokens']);
+        const rejectedPredictionTokens = this.getFiniteNumber(details['rejected_prediction_tokens']);
+
+        if (
+            reasoningTokens === undefined &&
+            acceptedPredictionTokens === undefined &&
+            rejectedPredictionTokens === undefined
+        ) {
+            return undefined;
+        }
+
+        return {
+            reasoning_tokens: reasoningTokens ?? 0,
+            accepted_prediction_tokens: acceptedPredictionTokens ?? 0,
+            rejected_prediction_tokens: rejectedPredictionTokens ?? 0
+        };
+    }
+
+    private buildUsage(
+        promptTokens: number | undefined,
+        completionTokens: number | undefined,
+        totalTokens: number | undefined,
+        promptDetails?: unknown,
+        completionDetails?: unknown
+    ): OpenAIUsage | undefined {
+        if (promptTokens === undefined || completionTokens === undefined) {
+            return undefined;
+        }
+
+        const usage: OpenAIUsage = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens ?? promptTokens + completionTokens
+        };
+
+        const normalizedPromptDetails = this.buildPromptTokenDetails(promptDetails);
+        if (normalizedPromptDetails) {
+            usage.prompt_tokens_details = normalizedPromptDetails;
+        }
+
+        const normalizedCompletionDetails = this.buildCompletionTokenDetails(completionDetails);
+        if (normalizedCompletionDetails) {
+            usage.completion_tokens_details = normalizedCompletionDetails;
+        }
+
+        return usage;
+    }
+
+    private buildChatUsage(value: unknown): OpenAIUsage | undefined {
+        return this.buildUsage(
+            this.readNumber(value, 'prompt_tokens'),
+            this.readNumber(value, 'completion_tokens'),
+            this.readNumber(value, 'total_tokens'),
+            this.getRecord(value)?.['prompt_tokens_details'],
+            this.getRecord(value)?.['completion_tokens_details']
+        );
+    }
+
+    private buildResponsesUsage(value: unknown): OpenAIUsage | undefined {
+        return this.buildUsage(
+            this.readNumber(value, 'input_tokens'),
+            this.readNumber(value, 'output_tokens'),
+            this.readNumber(value, 'total_tokens'),
+            this.getRecord(value)?.['input_tokens_details'],
+            this.getRecord(value)?.['output_tokens_details']
+        );
+    }
+
+    private extractChatResponseMetadata(value: unknown): OpenAIResponseMetadata {
+        const record = this.getRecord(value);
+        if (!record) {
+            return {};
+        }
+
+        const choice0 = Array.isArray(record['choices']) ? this.getRecord(record['choices'][0]) : undefined;
+        const metadata: OpenAIResponseMetadata = {};
+        if (typeof record['id'] === 'string') {
+            metadata.id = record['id'];
+        }
+        if (typeof record['model'] === 'string') {
+            metadata.model = record['model'];
+        }
+        const created = this.getFiniteNumber(record['created']);
+        if (created !== undefined) {
+            metadata.created = created;
+        }
+        if (typeof record['system_fingerprint'] === 'string') {
+            metadata.system_fingerprint = record['system_fingerprint'];
+        }
+        if (typeof record['service_tier'] === 'string') {
+            metadata.service_tier = record['service_tier'];
+        }
+        if (choice0 && typeof choice0['finish_reason'] === 'string') {
+            metadata.finish_reason = choice0['finish_reason'];
+        }
+        return metadata;
+    }
+
+    private mergeResponseMetadata(
+        current: OpenAIResponseMetadata,
+        next: OpenAIResponseMetadata
+    ): OpenAIResponseMetadata {
+        return {
+            ...current,
+            ...Object.fromEntries(
+                Object.entries(next).filter(([, value]) => value !== undefined)
+            )
+        };
     }
 
     constructor(config: OpenAIConfig) {
@@ -545,6 +781,7 @@ export class OpenAIClient {
             const maxTokens = (typeof streamOptions.maxTokens === 'number' && streamOptions.maxTokens > 0)
                 ? streamOptions.maxTokens
                 : 2048;
+            const requestOptionsFromCaller = streamOptions.requestOptions ?? {};
 
             // Build request options
             const requestOptions: OpenAI.Chat.ChatCompletionCreateParamsStreaming = {
@@ -552,9 +789,16 @@ export class OpenAIClient {
                 messages: openaiMessages,
                 stream: true,
                 stream_options: { include_usage: true },
-                temperature: 1.0,
+                temperature: requestOptionsFromCaller.temperature ?? 1.0,
                 max_tokens: maxTokens
             };
+            if (requestOptionsFromCaller.topP !== undefined) {
+                requestOptions.top_p = requestOptionsFromCaller.topP;
+            }
+            if (requestOptionsFromCaller.stop !== undefined) {
+                requestOptions.stop = requestOptionsFromCaller.stop;
+            }
+            this.applyOpenAICompatibleRequestExtras(requestOptions, requestOptionsFromCaller);
 
             // Add tools if provided
             if (streamOptions.tools && streamOptions.tools.length > 0) {
@@ -571,7 +815,8 @@ export class OpenAIClient {
 
             let chunkCount = 0;
             let finishReason: string | null = null;
-            let streamUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+            let streamUsage: OpenAIUsage | undefined;
+            let responseMetadata: OpenAIResponseMetadata = {};
 
             for await (const chunk of stream) {
                 chunkCount++;
@@ -579,8 +824,13 @@ export class OpenAIClient {
                     break;
                 }
 
+                responseMetadata = this.mergeResponseMetadata(
+                    responseMetadata,
+                    this.extractChatResponseMetadata(chunk)
+                );
+
                 if (chunk.usage) {
-                    streamUsage = { prompt_tokens: chunk.usage.prompt_tokens, completion_tokens: chunk.usage.completion_tokens };
+                    streamUsage = this.buildChatUsage(chunk.usage);
                 }
 
                 const choice0 = chunk.choices[0];
@@ -593,6 +843,11 @@ export class OpenAIClient {
                 if (typeof messageContent === 'string' && messageContent.length > 0) {
                     sawAnyModelOutput = true;
                     thinkTagParser.ingest(messageContent);
+                }
+                const messageRefusal = messageAny?.refusal;
+                if (typeof messageRefusal === 'string' && messageRefusal.length > 0) {
+                    sawAnyModelOutput = true;
+                    thinkTagParser.ingest(messageRefusal);
                 }
 
                 const messageReasoningRaw = (messageAny as any)?.reasoning_content ?? (messageAny as any)?.reasoning ?? (messageAny as any)?.thinking;
@@ -654,6 +909,11 @@ export class OpenAIClient {
                     // Some models embed thinking in <think>...</think> inside the normal content stream.
                     // Parse and route those parts to onThinkingChunk when available.
                     thinkTagParser.ingest(content);
+                }
+                const refusal = (delta as { refusal?: unknown } | undefined)?.refusal;
+                if (typeof refusal === 'string' && refusal.length > 0) {
+                    sawAnyModelOutput = true;
+                    thinkTagParser.ingest(refusal);
                 }
 
                 // Handle tool calls in streaming response
@@ -732,18 +992,32 @@ export class OpenAIClient {
                     finishReason
                 }, 'OpenAI');
 
-                const response = await this.client.chat.completions.create({
+                const fallbackRequest: OpenAI.Chat.ChatCompletionCreateParamsNonStreaming = {
                     model: model,
                     messages: openaiMessages,
-                    temperature: 0.7,
+                    temperature: requestOptionsFromCaller.temperature ?? 0.7,
                     max_tokens: maxTokens,
                     stream: false,
                     ...(streamOptions.tools && streamOptions.tools.length > 0 ? { tools: streamOptions.tools } : {}),
                     ...(streamOptions.toolChoice ? { tool_choice: streamOptions.toolChoice } : {})
-                }) as OpenAI.Chat.ChatCompletion;
+                };
+                if (requestOptionsFromCaller.topP !== undefined) {
+                    fallbackRequest.top_p = requestOptionsFromCaller.topP;
+                }
+                if (requestOptionsFromCaller.stop !== undefined) {
+                    fallbackRequest.stop = requestOptionsFromCaller.stop;
+                }
+                this.applyOpenAICompatibleRequestExtras(fallbackRequest, requestOptionsFromCaller);
+
+                const response = await this.client.chat.completions.create(fallbackRequest) as OpenAI.Chat.ChatCompletion;
+
+                responseMetadata = this.mergeResponseMetadata(
+                    responseMetadata,
+                    this.extractChatResponseMetadata(response)
+                );
 
                 if (response.usage && streamOptions.onUsage) {
-                    streamUsage = { prompt_tokens: response.usage.prompt_tokens, completion_tokens: response.usage.completion_tokens };
+                    streamUsage = this.buildChatUsage(response.usage);
                 }
 
                 const msgAny = response.choices?.[0]?.message as unknown as Record<string, unknown> | undefined;
@@ -751,6 +1025,11 @@ export class OpenAIClient {
                 if (typeof nonStreamContent === 'string' && nonStreamContent.length > 0) {
                     sawAnyModelOutput = true;
                     thinkTagParser.ingest(nonStreamContent);
+                }
+                const nonStreamRefusal = msgAny?.refusal;
+                if (typeof nonStreamRefusal === 'string' && nonStreamRefusal.length > 0) {
+                    sawAnyModelOutput = true;
+                    thinkTagParser.ingest(nonStreamRefusal);
                 }
 
                 const nonStreamReasoningRaw = msgAny?.reasoning_content ?? msgAny?.reasoning ?? msgAny?.thinking;
@@ -785,10 +1064,10 @@ export class OpenAIClient {
             }
 
             if (streamUsage && streamOptions.onUsage) {
-                streamOptions.onUsage({
-                    promptTokens: streamUsage.prompt_tokens,
-                    completionTokens: streamUsage.completion_tokens
-                });
+                streamOptions.onUsage(streamUsage);
+            }
+            if (Object.keys(responseMetadata).length > 0) {
+                streamOptions.onResponseMetadata?.(responseMetadata);
             }
 
             return fullContent;
@@ -1037,10 +1316,10 @@ export class OpenAIClient {
                     case 'response.completed': {
                         const completedResponse = event.response;
                         if (completedResponse?.usage && streamOptions.onUsage) {
-                            streamOptions.onUsage({
-                                promptTokens: completedResponse.usage.input_tokens,
-                                completionTokens: completedResponse.usage.output_tokens
-                            });
+                            const usage = this.buildResponsesUsage(completedResponse.usage);
+                            if (usage) {
+                                streamOptions.onUsage(usage);
+                            }
                         }
                         break;
                     }
@@ -1086,10 +1365,10 @@ export class OpenAIClient {
                 const response = await this.client.responses.create(fallbackRequest) as OpenAI.Responses.Response;
 
                 if (response?.usage && streamOptions.onUsage) {
-                    streamOptions.onUsage({
-                        promptTokens: response.usage.input_tokens,
-                        completionTokens: response.usage.output_tokens
-                    });
+                    const usage = this.buildResponsesUsage(response.usage);
+                    if (usage) {
+                        streamOptions.onUsage(usage);
+                    }
                 }
 
                 const nonStreamContent = response?.output_text;
@@ -1164,6 +1443,25 @@ export class OpenAIClient {
         });
     }
 
+    private applyOpenAICompatibleRequestExtras(
+        request: OpenAI.Chat.ChatCompletionCreateParamsStreaming | OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+        options: OpenAIRequestOptions
+    ): void {
+        const extras = request as unknown as Record<string, unknown>;
+        if (options.reasoning) {
+            extras['reasoning'] = options.reasoning;
+        }
+        if (typeof options.includeReasoning === 'boolean') {
+            extras['include_reasoning'] = options.includeReasoning;
+        }
+        if (options.responseFormat) {
+            extras['response_format'] = options.responseFormat;
+        }
+        if (options.serviceTier) {
+            extras['service_tier'] = options.serviceTier;
+        }
+    }
+
     /**
      * Converts ChatMessage array to OpenAI ChatCompletionMessageParam format.
      * Handles different message roles with their specific type requirements.
@@ -1171,16 +1469,17 @@ export class OpenAIClient {
     private convertMessagesToOpenAIFormat(messages: ChatMessage[]): OpenAI.Chat.ChatCompletionMessageParam[] {
         let fallbackIdCounter = 0;
         return messages.map(msg => {
+            const textContent = this.contentToText(msg.content);
             switch (msg.role) {
                 case 'system':
                     return {
                         role: 'system' as const,
-                        content: msg.content || ''
+                        content: textContent
                     };
                 case 'user':
                     return {
                         role: 'user' as const,
-                        content: msg.content || ''
+                        content: this.toUserMessageContent(msg.content)
                     };
                 case 'assistant':
                     // Assistant messages can have tool_calls
@@ -1192,7 +1491,7 @@ export class OpenAIClient {
                         if (validToolCalls.length > 0) {
                             return {
                                 role: 'assistant' as const,
-                                content: msg.content,
+                                content: textContent || null,
                                 tool_calls: validToolCalls.map(tc => ({
                                     id: tc.id,
                                     type: 'function' as const,
@@ -1206,7 +1505,7 @@ export class OpenAIClient {
                     }
                     return {
                         role: 'assistant' as const,
-                        content: msg.content || ''
+                        content: textContent
                     };
                 case 'tool':
                     // Tool messages must have content (not null) and a valid tool_call_id
@@ -1221,17 +1520,52 @@ export class OpenAIClient {
                     }
                     return {
                         role: 'tool' as const,
-                        content: msg.content || '',
+                        content: textContent,
                         tool_call_id: toolCallId
                     };
                 default:
                     // Fallback to user role
                     return {
                         role: 'user' as const,
-                        content: msg.content || ''
+                        content: this.toUserMessageContent(msg.content)
                     };
             }
         });
+    }
+
+    private contentToText(content: ChatMessageContent): string {
+        if (typeof content === 'string') {
+            return content;
+        }
+        if (!Array.isArray(content)) {
+            return '';
+        }
+        return content
+            .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+            .map(part => part.text)
+            .join('');
+    }
+
+    private toUserMessageContent(content: ChatMessageContent): string | OpenAI.Chat.ChatCompletionContentPart[] {
+        if (!Array.isArray(content)) {
+            return content ?? '';
+        }
+
+        const parts: OpenAI.Chat.ChatCompletionContentPart[] = [];
+        for (const part of content) {
+            if (part.type === 'text') {
+                parts.push({
+                    type: 'text',
+                    text: part.text
+                });
+            } else if (part.type === 'image_url') {
+                parts.push({
+                    type: 'image_url',
+                    image_url: part.image_url
+                });
+            }
+        }
+        return parts.length > 0 ? parts : '';
     }
 
     private convertMessagesToResponsesInput(messages: ChatMessage[]): OpenAI.Responses.ResponseInputItem[] {
@@ -1252,16 +1586,17 @@ export class OpenAIClient {
                 inputItems.push({
                     type: 'function_call_output',
                     call_id: callId,
-                    output: msg.content ?? ''
+                    output: this.contentToText(msg.content)
                 });
                 continue;
             }
 
             if (msg.role === 'assistant' && msg.tool_calls && msg.tool_calls.length > 0) {
-                if (typeof msg.content === 'string' && msg.content.length > 0) {
+                const assistantContent = this.contentToText(msg.content);
+                if (assistantContent.length > 0) {
                     inputItems.push({
                         role: 'assistant',
-                        content: msg.content,
+                        content: assistantContent,
                         type: 'message'
                     });
                 }
@@ -1282,7 +1617,7 @@ export class OpenAIClient {
                 continue;
             }
 
-            const content = msg.content ?? '';
+            const content = this.contentToText(msg.content);
             if (!content) {
                 continue;
             }

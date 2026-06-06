@@ -157,6 +157,7 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
         let maxOutputTokens = metadata.maxOutputTokens;
         let supportsToolCalling = metadata.supportsToolCalling;
         let supportsImageInput = metadata.supportsImageInput;
+        let multiplierNumeric = 1;
 
         const override = getModelOverride(modelId, 'claude');
         if (override) {
@@ -172,6 +173,9 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
             if (typeof override.supportsImageInput === 'boolean') {
                 supportsImageInput = override.supportsImageInput;
             }
+            if (typeof override.multiplierNumeric === 'number' && Number.isFinite(override.multiplierNumeric)) {
+                multiplierNumeric = override.multiplierNumeric;
+            }
         }
 
         const modelInfo: ClaudeModelInformation = {
@@ -182,6 +186,7 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
             version: apiModel.created_at || '1.0',
             maxInputTokens,
             maxOutputTokens,
+            multiplierNumeric,
             capabilities: {
                 toolCalling: supportsToolCalling,
                 imageInput: supportsImageInput

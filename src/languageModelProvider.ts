@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, CompletedToolCall } from './openaiClient';
+import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, CompletedToolCall, OpenAIUsage, OpenAIResponseMetadata, ChatMessageContentPart, OpenAIRequestOptions } from './openaiClient';
 import { API_KEY_SECRET_KEY, CACHED_MODELS_KEY } from './constants';
 import { getModelMetadata, isLLMModel, supportsToolCalling, ModelMetadata } from './modelMetadata';
 import { generateXmlToolPrompt, formatToolCallAsXml, formatToolResultAsText, XmlToolCallStreamParser, XmlToolParseOptions } from './xmlToolPrompt';
@@ -9,6 +9,9 @@ import { modelsDevRegistry } from './modelsDevClient';
 
 interface ModelInformation extends vscode.LanguageModelChatInformation {
     modelId: string;
+    supportedParameters?: string[];
+    defaultParameters?: Record<string, unknown>;
+    supportsReasoning?: boolean;
 }
 
 export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProvider<ModelInformation>, vscode.Disposable {
@@ -137,6 +140,30 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         if (apiModel.capabilities?.tool_calling !== undefined) {
             return apiModel.capabilities.tool_calling;
         }
+        if (apiModel.capabilities?.tools !== undefined) {
+            return apiModel.capabilities.tools;
+        }
+        if (apiModel.capabilities?.tool_use !== undefined) {
+            return apiModel.capabilities.tool_use;
+        }
+        if (apiModel.capabilities?.function_calling !== undefined) {
+            return apiModel.capabilities.function_calling;
+        }
+        if (apiModel.supports_tools !== undefined) {
+            return apiModel.supports_tools;
+        }
+        if (apiModel.supports_tool_use !== undefined) {
+            return apiModel.supports_tool_use;
+        }
+        if (apiModel.supports_function_calling !== undefined) {
+            return apiModel.supports_function_calling;
+        }
+        if (apiModel.supportsToolCall !== undefined) {
+            return apiModel.supportsToolCall;
+        }
+        if (apiModel.supported_parameters?.includes('tools')) {
+            return true;
+        }
         // Fall back to pre-fetched metadata
         return supportsToolCalling(apiModel.id);
     }
@@ -152,24 +179,94 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         let fromApi = false;
 
         // Override with API-provided values if available
-        if (apiModel.context_length !== undefined) {
-            metadata.maxInputTokens = apiModel.context_length;
+        const apiMaxInputTokens = this.getValidNumber(
+            apiModel.context_length,
+            apiModel.top_provider?.context_length,
+            apiModel.maxInputTokens,
+            apiModel.maxAllowedSize
+        );
+        if (apiMaxInputTokens !== undefined) {
+            metadata.maxInputTokens = apiMaxInputTokens;
             fromApi = true;
         }
-        if (apiModel.max_completion_tokens !== undefined) {
-            metadata.maxOutputTokens = apiModel.max_completion_tokens;
+        const apiMaxOutputTokens = this.getValidNumber(
+            apiModel.max_completion_tokens,
+            apiModel.top_provider?.max_completion_tokens,
+            apiModel.maxOutputTokens
+        );
+        if (apiMaxOutputTokens !== undefined) {
+            metadata.maxOutputTokens = apiMaxOutputTokens;
             fromApi = true;
         }
-        if (apiModel.capabilities?.tool_calling !== undefined) {
-            metadata.supportsToolCalling = apiModel.capabilities.tool_calling;
+        const apiSupportsToolCalling = this.getApiToolCallingSupport(apiModel);
+        if (apiSupportsToolCalling !== undefined) {
+            metadata.supportsToolCalling = apiSupportsToolCalling;
             fromApi = true;
         }
-        if (apiModel.capabilities?.vision !== undefined) {
-            metadata.supportsImageInput = apiModel.capabilities.vision;
+        const apiSupportsImageInput = this.getApiImageInputSupport(apiModel);
+        if (apiSupportsImageInput !== undefined) {
+            metadata.supportsImageInput = apiSupportsImageInput;
             fromApi = true;
         }
 
         return { metadata, fromApi };
+    }
+
+    private getValidNumber(...values: Array<number | undefined>): number | undefined {
+        for (const value of values) {
+            if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
+                return value;
+            }
+        }
+        return undefined;
+    }
+
+    private getApiToolCallingSupport(apiModel: APIModelInfo): boolean | undefined {
+        if (apiModel.capabilities?.tool_calling !== undefined) {
+            return apiModel.capabilities.tool_calling;
+        }
+        if (apiModel.capabilities?.tools !== undefined) {
+            return apiModel.capabilities.tools;
+        }
+        if (apiModel.capabilities?.tool_use !== undefined) {
+            return apiModel.capabilities.tool_use;
+        }
+        if (apiModel.capabilities?.function_calling !== undefined) {
+            return apiModel.capabilities.function_calling;
+        }
+        if (apiModel.supports_tools !== undefined) {
+            return apiModel.supports_tools;
+        }
+        if (apiModel.supports_tool_use !== undefined) {
+            return apiModel.supports_tool_use;
+        }
+        if (apiModel.supports_function_calling !== undefined) {
+            return apiModel.supports_function_calling;
+        }
+        if (apiModel.supportsToolCall !== undefined) {
+            return apiModel.supportsToolCall;
+        }
+        if (apiModel.supported_parameters?.includes('tools')) {
+            return true;
+        }
+        return undefined;
+    }
+
+    private getApiImageInputSupport(apiModel: APIModelInfo): boolean | undefined {
+        if (apiModel.capabilities?.vision !== undefined) {
+            return apiModel.capabilities.vision;
+        }
+        if (apiModel.supports_vision !== undefined) {
+            return apiModel.supports_vision;
+        }
+        if (apiModel.supportsImages !== undefined) {
+            return apiModel.disabledMultimodal ? false : apiModel.supportsImages;
+        }
+        const inputModalities = apiModel.architecture?.input_modalities;
+        if (inputModalities) {
+            return inputModalities.includes('image');
+        }
+        return undefined;
     }
 
     /**
@@ -210,6 +307,98 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         return nameWithoutPrefix.toLowerCase();
     }
 
+    private getCreditMultiplier(apiModel: APIModelInfo): number | undefined {
+        if (typeof apiModel.credit_multiplier === 'number' && Number.isFinite(apiModel.credit_multiplier)) {
+            return apiModel.credit_multiplier;
+        }
+        if (typeof apiModel.credits !== 'string') {
+            return undefined;
+        }
+        const match = apiModel.credits.match(/x\s*([0-9]+(?:\.[0-9]+)?)/i);
+        if (!match) {
+            return undefined;
+        }
+        const parsed = Number(match[1]);
+        return Number.isFinite(parsed) ? parsed : undefined;
+    }
+
+    private getModelVersion(apiModel: APIModelInfo): string {
+        if (typeof apiModel.created_at === 'string' && apiModel.created_at.trim()) {
+            return apiModel.created_at;
+        }
+        if (typeof apiModel.created_at === 'number' && Number.isFinite(apiModel.created_at)) {
+            return String(apiModel.created_at);
+        }
+        if (typeof apiModel.created === 'number' && Number.isFinite(apiModel.created) && apiModel.created > 0) {
+            return String(apiModel.created);
+        }
+        return '1.0';
+    }
+
+    private getModelDetail(apiModel: APIModelInfo): string | undefined {
+        const parts = [
+            apiModel.vendor,
+            apiModel.credits,
+            apiModel.architecture?.modality
+        ].filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
+        return parts.length > 0 ? parts.join(' | ') : undefined;
+    }
+
+    private getModelTooltip(
+        apiModel: APIModelInfo,
+        maxInputTokens: number,
+        maxOutputTokens: number,
+        supportsToolCalling: boolean,
+        supportsImageInput: boolean
+    ): string {
+        const lines: string[] = [];
+        const displayName = apiModel.display_name || apiModel.name || apiModel.id;
+        lines.push(displayName);
+        if (apiModel.description) {
+            lines.push(apiModel.description);
+        }
+        lines.push(`Context: ${maxInputTokens.toLocaleString()} input / ${maxOutputTokens.toLocaleString()} output tokens`);
+
+        const capabilities: string[] = [];
+        if (supportsToolCalling) {
+            capabilities.push('tools');
+        }
+        if (supportsImageInput) {
+            capabilities.push('images');
+        }
+        if (apiModel.supports_reasoning || apiModel.supportsReasoning || apiModel.capabilities?.reasoning) {
+            capabilities.push('reasoning');
+        }
+        if (capabilities.length > 0) {
+            lines.push(`Capabilities: ${capabilities.join(', ')}`);
+        }
+        if (apiModel.supported_parameters && apiModel.supported_parameters.length > 0) {
+            lines.push(`Parameters: ${apiModel.supported_parameters.join(', ')}`);
+        }
+        return lines.join('\n');
+    }
+
+    private getEditTools(apiModel: APIModelInfo, family: string): string[] | undefined {
+        const supportsEdits = apiModel.supported_parameters?.includes('tools')
+            || apiModel.supports_tools
+            || apiModel.supports_tool_use
+            || apiModel.supports_function_calling
+            || apiModel.supportsToolCall
+            || apiModel.capabilities?.tools
+            || apiModel.capabilities?.tool_use
+            || apiModel.capabilities?.function_calling
+            || apiModel.capabilities?.tool_calling;
+        if (!supportsEdits) {
+            return undefined;
+        }
+
+        const normalizedFamily = family.toLowerCase();
+        if (normalizedFamily.includes('gpt') || normalizedFamily.includes('o3') || normalizedFamily.includes('o4')) {
+            return ['apply-patch', 'multi-find-replace', 'find-replace', 'code-rewrite'];
+        }
+        return ['multi-find-replace', 'find-replace', 'code-rewrite'];
+    }
+
     private addModel(apiModel: APIModelInfo) {
         const { metadata, fromApi } = this.getModelInfo(apiModel);
         const family = this.extractModelFamily(apiModel.id);
@@ -218,6 +407,11 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         let maxOutputTokens = metadata.maxOutputTokens;
         let supportsToolCalling = metadata.supportsToolCalling;
         let supportsImageInput = metadata.supportsImageInput;
+        let multiplierNumeric = this.getCreditMultiplier(apiModel) ?? 1;
+        const supportsReasoning = apiModel.supports_reasoning === true
+            || apiModel.supportsReasoning === true
+            || apiModel.capabilities?.reasoning === true
+            || typeof apiModel.default_parameters?.['reasoning'] === 'object';
 
         const override = getModelOverride(apiModel.id, 'openai');
         if (override) {
@@ -233,19 +427,31 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             if (typeof override.supportsImageInput === 'boolean') {
                 supportsImageInput = override.supportsImageInput;
             }
+            if (typeof override.multiplierNumeric === 'number' && Number.isFinite(override.multiplierNumeric)) {
+                multiplierNumeric = override.multiplierNumeric;
+            }
         }
 
         const modelInfo: ModelInformation = {
             modelId: apiModel.id,
             id: `oai2lmapi-${apiModel.id}`,
             family: family,
-            name: apiModel.id,
-            version: '1.0',
+            name: apiModel.display_name || apiModel.name || apiModel.id,
+            version: this.getModelVersion(apiModel),
+            detail: this.getModelDetail(apiModel),
+            tooltip: this.getModelTooltip(apiModel, maxInputTokens, maxOutputTokens, supportsToolCalling, supportsImageInput),
             maxInputTokens,
             maxOutputTokens,
+            multiplierNumeric,
+            isUserSelectable: true,
+            supportedParameters: apiModel.supported_parameters,
+            defaultParameters: apiModel.default_parameters,
+            supportsReasoning,
             capabilities: {
                 toolCalling: supportsToolCalling,
-                imageInput: supportsImageInput
+                imageInput: supportsImageInput,
+                editTools: this.getEditTools(apiModel, family),
+                editToolsHint: this.getEditTools(apiModel, family)
             }
         };
 
@@ -342,6 +548,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         const modelBudget = typeof model.maxOutputTokens === 'number' && Number.isFinite(model.maxOutputTokens) ? model.maxOutputTokens : 2048;
         // Cap to avoid proxies rejecting very large max_tokens.
         const maxTokens = Math.max(1, Math.min(budgetNumber ?? modelBudget, 8192));
+        const requestOptions = this.buildRequestOptions(model, options, modelOverride);
 
         // Create abort controller from cancellation token
         const abortController = new AbortController();
@@ -353,6 +560,8 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
 
         // Track reported tool call IDs to prevent duplicates
         const reportedToolCallIds = new Set<string>();
+        let responseUsage: OpenAIUsage | undefined;
+        let responseMetadata: OpenAIResponseMetadata | undefined;
 
         // For prompt-based tool calling, use streaming parser to detect tool calls incrementally
         const streamParser = usePromptBasedToolCalling && availableToolNames.length > 0 
@@ -419,15 +628,20 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     }
                 },
                 onUsage: (usage) => {
-                    const inputChars = chatMessages.reduce((sum, msg) => sum + (msg.content?.length ?? 0), 0);
-                    if (inputChars > 0 && usage.promptTokens > 0) {
-                        this.tokensPerChar = usage.promptTokens / inputChars;
+                    const inputChars = chatMessages.reduce((sum, msg) => sum + this.getContentTextLength(msg.content), 0);
+                    responseUsage = usage;
+                    if (inputChars > 0 && usage.prompt_tokens > 0) {
+                        this.tokensPerChar = usage.prompt_tokens / inputChars;
                     }
+                },
+                onResponseMetadata: (metadata) => {
+                    responseMetadata = metadata;
                 },
                 signal: abortController.signal,
                 tools,
                 toolChoice,
-                maxTokens
+                maxTokens,
+                requestOptions
             }
         );
 
@@ -454,6 +668,139 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                 progress.report(new vscode.LanguageModelTextPart(nonToolCallText));
             }
         }
+
+        if (responseUsage) {
+            progress.report(this.createUsageDataPart(responseUsage));
+        }
+        if (responseMetadata) {
+            progress.report(this.createResponseMetadataDataPart(responseMetadata));
+        }
+    }
+
+    private createUsageDataPart(usage: OpenAIUsage): vscode.LanguageModelDataPart {
+        return new vscode.LanguageModelDataPart(
+            new TextEncoder().encode(JSON.stringify(usage)),
+            'usage'
+        );
+    }
+
+    private createResponseMetadataDataPart(metadata: OpenAIResponseMetadata): vscode.LanguageModelDataPart {
+        return new vscode.LanguageModelDataPart(
+            new TextEncoder().encode(JSON.stringify(metadata)),
+            'openai.response_metadata'
+        );
+    }
+
+    private buildRequestOptions(
+        model: ModelInformation,
+        options: vscode.ProvideLanguageModelChatResponseOptions,
+        override: ReturnType<typeof getModelOverride>
+    ): OpenAIRequestOptions {
+        const modelOptions = this.getRecord((options as { modelOptions?: unknown }).modelOptions);
+        const modelConfiguration = this.getRecord((options as { modelConfiguration?: unknown }).modelConfiguration);
+        const defaultParameters = this.getRecord(model.defaultParameters);
+
+        const temperature = this.getFiniteNumber(modelOptions?.['temperature'])
+            ?? this.getFiniteNumber(defaultParameters?.['temperature'])
+            ?? (typeof override?.temperature === 'number' && Number.isFinite(override.temperature) ? override.temperature : undefined);
+        const topP = this.getFiniteNumber(modelOptions?.['top_p'])
+            ?? this.getFiniteNumber(modelOptions?.['topP'])
+            ?? this.getFiniteNumber(defaultParameters?.['top_p']);
+        const stop = this.getStopValue(modelOptions?.['stop']);
+        const reasoning = this.getReasoningValue(modelOptions, modelConfiguration, defaultParameters, override, model);
+        const includeReasoning = typeof modelOptions?.['include_reasoning'] === 'boolean'
+            ? modelOptions['include_reasoning'] as boolean
+            : typeof modelOptions?.['includeReasoning'] === 'boolean'
+                ? modelOptions['includeReasoning'] as boolean
+                : undefined;
+        const responseFormat = this.getRecord(modelOptions?.['response_format']) ?? this.getRecord(modelOptions?.['responseFormat']);
+        const serviceTier = typeof modelOptions?.['service_tier'] === 'string'
+            ? modelOptions['service_tier']
+            : typeof modelOptions?.['serviceTier'] === 'string'
+                ? modelOptions['serviceTier']
+                : undefined;
+
+        return {
+            ...(temperature !== undefined ? { temperature } : {}),
+            ...(topP !== undefined ? { topP } : {}),
+            ...(stop !== undefined ? { stop } : {}),
+            ...(reasoning !== undefined ? { reasoning } : {}),
+            ...(includeReasoning !== undefined ? { includeReasoning } : {}),
+            ...(responseFormat !== undefined ? { responseFormat } : {}),
+            ...(serviceTier !== undefined ? { serviceTier } : {})
+        };
+    }
+
+    private getRecord(value: unknown): Record<string, unknown> | undefined {
+        return typeof value === 'object' && value !== null && !Array.isArray(value)
+            ? value as Record<string, unknown>
+            : undefined;
+    }
+
+    private getFiniteNumber(value: unknown): number | undefined {
+        return typeof value === 'number' && Number.isFinite(value)
+            ? value
+            : undefined;
+    }
+
+    private getStopValue(value: unknown): string | string[] | undefined {
+        if (typeof value === 'string') {
+            return value;
+        }
+        if (Array.isArray(value) && value.every(item => typeof item === 'string')) {
+            return value;
+        }
+        return undefined;
+    }
+
+    private getReasoningValue(
+        modelOptions: Record<string, unknown> | undefined,
+        modelConfiguration: Record<string, unknown> | undefined,
+        defaultParameters: Record<string, unknown> | undefined,
+        override: ReturnType<typeof getModelOverride>,
+        model: ModelInformation
+    ): Record<string, unknown> | undefined {
+        const explicitReasoning = this.getRecord(modelOptions?.['reasoning']);
+        if (explicitReasoning) {
+            return explicitReasoning;
+        }
+
+        const defaultReasoning = this.getRecord(defaultParameters?.['reasoning']);
+        const effort = typeof modelOptions?.['reasoning_effort'] === 'string'
+            ? modelOptions['reasoning_effort']
+            : typeof modelOptions?.['reasoningEffort'] === 'string'
+                ? modelOptions['reasoningEffort']
+                : typeof modelConfiguration?.['reasoningEffort'] === 'string'
+                    ? modelConfiguration['reasoningEffort']
+                    : undefined;
+        if (effort) {
+            return { ...(defaultReasoning ?? {}), effort };
+        }
+
+        if (typeof override?.thinkingLevel === 'string' && override.thinkingLevel !== 'auto') {
+            if (override.thinkingLevel === 'none') {
+                return { ...(defaultReasoning ?? {}), enabled: false, effort: 'none' };
+            }
+            return { ...(defaultReasoning ?? {}), effort: override.thinkingLevel };
+        }
+        if (typeof override?.thinkingLevel === 'number' && Number.isFinite(override.thinkingLevel)) {
+            return { ...(defaultReasoning ?? {}), enabled: true, max_tokens: override.thinkingLevel };
+        }
+
+        if (defaultReasoning && model.supportsReasoning) {
+            return defaultReasoning;
+        }
+        return undefined;
+    }
+
+    private getContentTextLength(content: ChatMessage['content']): number {
+        if (typeof content === 'string') {
+            return content.length;
+        }
+        if (!Array.isArray(content)) {
+            return 0;
+        }
+        return content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0);
     }
 
     /**
@@ -476,6 +823,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                 const toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> = [];
                 const toolResults: Array<{ tool_call_id: string; content: string; toolName?: string }> = [];
                 let textContent = '';
+                const contentParts: ChatMessageContentPart[] = [];
 
                 for (const part of msg.content) {
                     if (this.isToolCallPart(part)) {
@@ -521,7 +869,16 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                         });
                     } else {
                         // Regular text content
-                        textContent += this.extractTextFromPart(part);
+                        const extractedParts = this.extractContentPartsFromPart(part);
+                        if (extractedParts.length > 0) {
+                            contentParts.push(...extractedParts);
+                            textContent += extractedParts
+                                .filter((contentPart): contentPart is { type: 'text'; text: string } => contentPart.type === 'text')
+                                .map(contentPart => contentPart.text)
+                                .join('');
+                        } else {
+                            textContent += this.extractTextFromPart(part);
+                        }
                     }
                 }
 
@@ -570,10 +927,12 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                         }
                     }
                     // Regular message with text content
-                    else if (textContent) {
+                    else if (textContent || contentParts.length > 0) {
                         result.push({
                             role,
-                            content: textContent
+                            content: role === 'user' && contentParts.some(part => part.type === 'image_url')
+                                ? this.mergeAdjacentTextParts(contentParts)
+                                : textContent
                         });
                     }
                 }
@@ -583,14 +942,59 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     content: msg.content
                 });
             } else if (msg.content && typeof msg.content === 'object') {
+                const contentParts = this.extractContentPartsFromPart(msg.content);
                 result.push({
                     role,
-                    content: this.extractTextFromPart(msg.content)
+                    content: role === 'user' && contentParts.some(part => part.type === 'image_url')
+                        ? this.mergeAdjacentTextParts(contentParts)
+                        : this.extractTextFromPart(msg.content)
                 });
             }
         }
 
         return result;
+    }
+
+    private mergeAdjacentTextParts(parts: ChatMessageContentPart[]): ChatMessageContentPart[] {
+        const merged: ChatMessageContentPart[] = [];
+        for (const part of parts) {
+            const previous = merged[merged.length - 1];
+            if (part.type === 'text' && previous?.type === 'text') {
+                previous.text += part.text;
+            } else {
+                merged.push(part);
+            }
+        }
+        return merged;
+    }
+
+    private extractContentPartsFromPart(part: unknown): ChatMessageContentPart[] {
+        if (!part || typeof part !== 'object') {
+            return [];
+        }
+
+        if ('mimeType' in part && 'data' in part) {
+            const dataPart = part as { mimeType?: unknown; data?: unknown };
+            if (typeof dataPart.mimeType === 'string' && dataPart.data instanceof Uint8Array) {
+                if (dataPart.mimeType.startsWith('image/')) {
+                    return [{
+                        type: 'image_url',
+                        image_url: {
+                            url: `data:${dataPart.mimeType};base64,${Buffer.from(dataPart.data).toString('base64')}`
+                        }
+                    }];
+                }
+                if (dataPart.mimeType.startsWith('text/')) {
+                    return [{
+                        type: 'text',
+                        text: new TextDecoder().decode(dataPart.data)
+                    }];
+                }
+            }
+        }
+
+        const text = this.extractTextFromPart(part);
+        return text ? [{ type: 'text', text }] : [];
     }
 
     /**
@@ -830,10 +1234,10 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                 return 'user';
             case vscode.LanguageModelChatMessageRole.Assistant:
                 return 'assistant';
-            // System role may not be directly exposed in LanguageModelChatMessageRole enum
-            // but we handle it as a fallback
             default:
-                // Default to 'user' for safety, though ideally we'd have explicit System handling
+                if (role === 0 || String(role).toLowerCase() === 'system') {
+                    return 'system';
+                }
                 return 'user';
         }
     }

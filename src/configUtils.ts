@@ -7,6 +7,10 @@ import * as vscode from 'vscode';
 export interface ModelOverrideConfig {
     maxInputTokens?: number;
     maxOutputTokens?: number;
+    /**
+     * Numeric cost/scale multiplier shown by VS Code/Copilot model picker surfaces.
+     */
+    multiplierNumeric?: number;
     supportsToolCalling?: boolean;
     supportsImageInput?: boolean;
     /**

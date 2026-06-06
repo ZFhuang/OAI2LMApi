@@ -207,6 +207,7 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
         let supportsImageInput = typeof registryMetadata.supportsImageInput === 'boolean'
             ? registryMetadata.supportsImageInput
             : apiVision;
+        let multiplierNumeric = 1;
 
         const override = getModelOverride(modelId, 'gemini');
         if (override) {
@@ -224,6 +225,9 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
             if (typeof override.supportsImageInput === 'boolean') {
                 supportsImageInput = override.supportsImageInput;
             }
+            if (typeof override.multiplierNumeric === 'number' && Number.isFinite(override.multiplierNumeric)) {
+                multiplierNumeric = override.multiplierNumeric;
+            }
         }
 
         const modelInfo: GeminiModelInformation = {
@@ -234,6 +238,7 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
             version: apiModel.version || '1.0',
             maxInputTokens,
             maxOutputTokens,
+            multiplierNumeric,
             capabilities: {
                 toolCalling: supportsToolCalling,
                 imageInput: supportsImageInput

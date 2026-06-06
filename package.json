@@ -14,6 +14,9 @@
     "node": ">=18.0.0",
     "pnpm": ">=10.0.0"
   },
+  "enabledApiProposals": [
+    "chatProvider"
+  ],
   "categories": [
     "AI",
     "Chat"
@@ -150,7 +153,7 @@
         "oai2lmapi.modelOverrides": {
           "type": "object",
           "default": {},
-          "description": "Per-model configuration overrides. Keys are model name patterns (supports wildcards like 'gemini-*'), values are objects with optional: maxInputTokens, maxOutputTokens, supportsToolCalling, supportsImageInput, temperature, thinkingLevel (number for budget, or 'low'/'medium'/'high'/'auto'), usePromptBasedToolCalling (boolean to use XML-based prompt engineering for tool calling), useResponsesApi (boolean to force/disable OpenAI Responses API for matching OpenAI models), suppressChainOfThought (boolean to suppress chain-of-thought transmission for matching models).",
+          "description": "Per-model configuration overrides. Keys are model name patterns (supports wildcards like 'gemini-*'), values are objects with optional: maxInputTokens, maxOutputTokens, multiplierNumeric, supportsToolCalling, supportsImageInput, temperature, thinkingLevel (number for budget, or 'low'/'medium'/'high'/'auto'), usePromptBasedToolCalling (boolean to use XML-based prompt engineering for tool calling), useResponsesApi (boolean to force/disable OpenAI Responses API for matching OpenAI models), suppressChainOfThought (boolean to suppress chain-of-thought transmission for matching models).",
           "additionalProperties": {
             "type": "object",
             "properties": {
@@ -161,6 +164,10 @@
               "maxOutputTokens": {
                 "type": "number",
                 "description": "Override max output tokens for matching models"
+              },
+              "multiplierNumeric": {
+                "type": "number",
+                "description": "Override the numeric model cost/scale multiplier shown by VS Code/Copilot model picker surfaces"
               },
               "supportsToolCalling": {
                 "type": "boolean",
@@ -216,6 +223,10 @@
                 "maxOutputTokens": {
                   "type": "number",
                   "description": "Override max output tokens for matching models"
+                },
+                "multiplierNumeric": {
+                  "type": "number",
+                  "description": "Override the numeric model cost/scale multiplier shown by VS Code/Copilot model picker surfaces"
                 },
                 "supportsToolCalling": {
                   "type": "boolean",
