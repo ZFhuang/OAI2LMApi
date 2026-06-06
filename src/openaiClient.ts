@@ -135,11 +135,15 @@ export interface OpenAIUsage {
 
 export interface OpenAIResponseMetadata {
     id?: string;
+    object?: string;
     model?: string;
     created?: number;
     system_fingerprint?: string;
     service_tier?: string;
     finish_reason?: string;
+    status?: string;
+    error?: unknown;
+    incomplete_details?: unknown;
 }
 
 export interface OpenAIRequestOptions {
@@ -476,7 +480,7 @@ export interface StreamOptions {
      * Called when a thinking/reasoning content chunk is received.
      * Some models (e.g., DeepSeek) return chain-of-thought reasoning in a separate field.
      */
-    onThinkingChunk?: (chunk: string) => void;
+    onThinkingChunk?: (chunk: string, metadata?: Record<string, unknown>) => void;
     /**
      * @deprecated Use onToolCallsComplete for batch reporting of all tool calls
      */
@@ -540,6 +544,30 @@ export class OpenAIClient {
 
     private readNumber(value: unknown, key: string): number | undefined {
         return this.getFiniteNumber(this.getRecord(value)?.[key]);
+    }
+
+    private readNumberFromKeys(value: unknown, keys: string[]): number | undefined {
+        for (const key of keys) {
+            const numberValue = this.readNumber(value, key);
+            if (numberValue !== undefined) {
+                return numberValue;
+            }
+        }
+        return undefined;
+    }
+
+    private readRecordFromKeys(value: unknown, keys: string[]): Record<string, unknown> | undefined {
+        const record = this.getRecord(value);
+        if (!record) {
+            return undefined;
+        }
+        for (const key of keys) {
+            const candidate = this.getRecord(record[key]);
+            if (candidate) {
+                return candidate;
+            }
+        }
+        return undefined;
     }
 
     private buildPromptTokenDetails(value: unknown): OpenAIUsage['prompt_tokens_details'] | undefined {
@@ -618,22 +646,52 @@ export class OpenAIClient {
 
     private buildChatUsage(value: unknown): OpenAIUsage | undefined {
         return this.buildUsage(
-            this.readNumber(value, 'prompt_tokens'),
-            this.readNumber(value, 'completion_tokens'),
-            this.readNumber(value, 'total_tokens'),
-            this.getRecord(value)?.['prompt_tokens_details'],
-            this.getRecord(value)?.['completion_tokens_details']
+            this.readNumberFromKeys(value, ['prompt_tokens', 'input_tokens', 'promptTokens', 'inputTokens']),
+            this.readNumberFromKeys(value, ['completion_tokens', 'output_tokens', 'completionTokens', 'outputTokens']),
+            this.readNumberFromKeys(value, ['total_tokens', 'totalTokens']),
+            this.readRecordFromKeys(value, ['prompt_tokens_details', 'input_tokens_details', 'promptTokensDetails', 'inputTokensDetails']),
+            this.readRecordFromKeys(value, ['completion_tokens_details', 'output_tokens_details', 'completionTokensDetails', 'outputTokensDetails'])
         );
     }
 
     private buildResponsesUsage(value: unknown): OpenAIUsage | undefined {
         return this.buildUsage(
-            this.readNumber(value, 'input_tokens'),
-            this.readNumber(value, 'output_tokens'),
-            this.readNumber(value, 'total_tokens'),
-            this.getRecord(value)?.['input_tokens_details'],
-            this.getRecord(value)?.['output_tokens_details']
+            this.readNumberFromKeys(value, ['input_tokens', 'prompt_tokens', 'inputTokens', 'promptTokens']),
+            this.readNumberFromKeys(value, ['output_tokens', 'completion_tokens', 'outputTokens', 'completionTokens']),
+            this.readNumberFromKeys(value, ['total_tokens', 'totalTokens']),
+            this.readRecordFromKeys(value, ['input_tokens_details', 'prompt_tokens_details', 'inputTokensDetails', 'promptTokensDetails']),
+            this.readRecordFromKeys(value, ['output_tokens_details', 'completion_tokens_details', 'outputTokensDetails', 'completionTokensDetails'])
         );
+    }
+
+    private extractReasoningMetadata(value: unknown): Record<string, unknown> | undefined {
+        const record = this.getRecord(value);
+        if (!record) {
+            return undefined;
+        }
+
+        const metadata: Record<string, unknown> = {};
+        for (const key of ['reasoning_details', 'thinking_details', 'reasoning_signature', 'signature']) {
+            if (record[key] !== undefined) {
+                metadata[key] = record[key];
+            }
+        }
+        return Object.keys(metadata).length > 0 ? metadata : undefined;
+    }
+
+    private extractResponsesEventMetadata(value: unknown): Record<string, unknown> | undefined {
+        const record = this.getRecord(value);
+        if (!record) {
+            return undefined;
+        }
+
+        const metadata: Record<string, unknown> = {};
+        for (const key of ['type', 'item_id', 'output_index', 'content_index', 'sequence_number']) {
+            if (record[key] !== undefined) {
+                metadata[key] = record[key];
+            }
+        }
+        return Object.keys(metadata).length > 0 ? metadata : undefined;
     }
 
     private extractChatResponseMetadata(value: unknown): OpenAIResponseMetadata {
@@ -646,6 +704,9 @@ export class OpenAIClient {
         const metadata: OpenAIResponseMetadata = {};
         if (typeof record['id'] === 'string') {
             metadata.id = record['id'];
+        }
+        if (typeof record['object'] === 'string') {
+            metadata.object = record['object'];
         }
         if (typeof record['model'] === 'string') {
             metadata.model = record['model'];
@@ -662,6 +723,41 @@ export class OpenAIClient {
         }
         if (choice0 && typeof choice0['finish_reason'] === 'string') {
             metadata.finish_reason = choice0['finish_reason'];
+        }
+        return metadata;
+    }
+
+    private extractResponsesResponseMetadata(value: unknown): OpenAIResponseMetadata {
+        const record = this.getRecord(value);
+        if (!record) {
+            return {};
+        }
+
+        const metadata: OpenAIResponseMetadata = {};
+        if (typeof record['id'] === 'string') {
+            metadata.id = record['id'];
+        }
+        if (typeof record['object'] === 'string') {
+            metadata.object = record['object'];
+        }
+        if (typeof record['model'] === 'string') {
+            metadata.model = record['model'];
+        }
+        const created = this.getFiniteNumber(record['created_at']) ?? this.getFiniteNumber(record['created']);
+        if (created !== undefined) {
+            metadata.created = created;
+        }
+        if (typeof record['service_tier'] === 'string') {
+            metadata.service_tier = record['service_tier'];
+        }
+        if (typeof record['status'] === 'string') {
+            metadata.status = record['status'];
+        }
+        if (record['error'] !== undefined && record['error'] !== null) {
+            metadata.error = record['error'];
+        }
+        if (record['incomplete_details'] !== undefined && record['incomplete_details'] !== null) {
+            metadata.incomplete_details = record['incomplete_details'];
         }
         return metadata;
     }
@@ -857,7 +953,7 @@ export class OpenAIClient {
                     if (!streamOptions.suppressChainOfThought) {
                         thinkingChars += messageReasoning.length;
                         thinkTagParser.notifyThinkingReceived();
-                        streamOptions.onThinkingChunk?.(messageReasoning);
+                        streamOptions.onThinkingChunk?.(messageReasoning, this.extractReasoningMetadata(messageAny));
                     }
                 }
 
@@ -898,7 +994,7 @@ export class OpenAIClient {
                     if (!streamOptions.suppressChainOfThought) {
                         thinkingChars += reasoningContent.length;
                         thinkTagParser.notifyThinkingReceived();
-                        streamOptions.onThinkingChunk?.(reasoningContent);
+                        streamOptions.onThinkingChunk?.(reasoningContent, this.extractReasoningMetadata(deltaAny));
                     }
                 }
 
@@ -1038,7 +1134,7 @@ export class OpenAIClient {
                     sawAnyModelOutput = true;
                     if (!streamOptions.suppressChainOfThought) {
                         thinkingChars += nonStreamReasoning.length;
-                        streamOptions.onThinkingChunk?.(nonStreamReasoning);
+                        streamOptions.onThinkingChunk?.(nonStreamReasoning, this.extractReasoningMetadata(msgAny));
                     }
                 }
 
@@ -1130,14 +1226,19 @@ export class OpenAIClient {
         const maxTokens = (typeof streamOptions.maxTokens === 'number' && streamOptions.maxTokens > 0)
             ? streamOptions.maxTokens
             : 2048;
+        const requestOptionsFromCaller = streamOptions.requestOptions ?? {};
 
         const requestOptions: OpenAI.Responses.ResponseCreateParamsStreaming = {
             model,
             input: responseInput,
             stream: true,
-            temperature: 1.0,
+            temperature: requestOptionsFromCaller.temperature ?? 1.0,
             max_output_tokens: maxTokens
         };
+        if (requestOptionsFromCaller.topP !== undefined) {
+            requestOptions.top_p = requestOptionsFromCaller.topP;
+        }
+        this.applyOpenAICompatibleRequestExtras(requestOptions, requestOptionsFromCaller);
 
         if (responseTools && responseTools.length > 0) {
             requestOptions.tools = responseTools;
@@ -1208,6 +1309,7 @@ export class OpenAIClient {
         };
 
         let chunkCount = 0;
+        let responseMetadata: OpenAIResponseMetadata = {};
 
         try {
             const stream = await this.client.responses.create(requestOptions);
@@ -1254,7 +1356,7 @@ export class OpenAIClient {
                         if (!streamOptions.suppressChainOfThought && event.delta) {
                             reasoningDeltaItemIds.add(event.item_id);
                             thinkTagParser.notifyThinkingReceived();
-                            streamOptions.onThinkingChunk?.(event.delta);
+                            streamOptions.onThinkingChunk?.(event.delta, this.extractResponsesEventMetadata(event));
                         }
                         break;
                     }
@@ -1262,7 +1364,7 @@ export class OpenAIClient {
                         sawAnyModelOutput = true;
                         if (!streamOptions.suppressChainOfThought && event.text && !reasoningDeltaItemIds.has(event.item_id)) {
                             thinkTagParser.notifyThinkingReceived();
-                            streamOptions.onThinkingChunk?.(event.text);
+                            streamOptions.onThinkingChunk?.(event.text, this.extractResponsesEventMetadata(event));
                         }
                         break;
                     }
@@ -1315,6 +1417,10 @@ export class OpenAIClient {
                     }
                     case 'response.completed': {
                         const completedResponse = event.response;
+                        responseMetadata = this.mergeResponseMetadata(
+                            responseMetadata,
+                            this.extractResponsesResponseMetadata(completedResponse)
+                        );
                         if (completedResponse?.usage && streamOptions.onUsage) {
                             const usage = this.buildResponsesUsage(completedResponse.usage);
                             if (usage) {
@@ -1351,9 +1457,13 @@ export class OpenAIClient {
                     model,
                     input: responseInput,
                     stream: false,
-                    temperature: 0.7,
+                    temperature: requestOptionsFromCaller.temperature ?? 0.7,
                     max_output_tokens: maxTokens
                 };
+                if (requestOptionsFromCaller.topP !== undefined) {
+                    fallbackRequest.top_p = requestOptionsFromCaller.topP;
+                }
+                this.applyOpenAICompatibleRequestExtras(fallbackRequest, requestOptionsFromCaller);
 
                 if (responseTools && responseTools.length > 0) {
                     fallbackRequest.tools = responseTools;
@@ -1363,6 +1473,11 @@ export class OpenAIClient {
                 }
 
                 const response = await this.client.responses.create(fallbackRequest) as OpenAI.Responses.Response;
+
+                responseMetadata = this.mergeResponseMetadata(
+                    responseMetadata,
+                    this.extractResponsesResponseMetadata(response)
+                );
 
                 if (response?.usage && streamOptions.onUsage) {
                     const usage = this.buildResponsesUsage(response.usage);
@@ -1407,6 +1522,10 @@ export class OpenAIClient {
                 thinkTagParser.flush();
             }
 
+            if (Object.keys(responseMetadata).length > 0) {
+                streamOptions.onResponseMetadata?.(responseMetadata);
+            }
+
             return fullContent;
         } catch (error: unknown) {
             const err = error as Record<string, unknown>;
@@ -1444,10 +1563,17 @@ export class OpenAIClient {
     }
 
     private applyOpenAICompatibleRequestExtras(
-        request: OpenAI.Chat.ChatCompletionCreateParamsStreaming | OpenAI.Chat.ChatCompletionCreateParamsNonStreaming,
+        request:
+            | OpenAI.Chat.ChatCompletionCreateParamsStreaming
+            | OpenAI.Chat.ChatCompletionCreateParamsNonStreaming
+            | OpenAI.Responses.ResponseCreateParamsStreaming
+            | OpenAI.Responses.ResponseCreateParamsNonStreaming,
         options: OpenAIRequestOptions
     ): void {
         const extras = request as unknown as Record<string, unknown>;
+        if (options.stop !== undefined) {
+            extras['stop'] = options.stop;
+        }
         if (options.reasoning) {
             extras['reasoning'] = options.reasoning;
         }

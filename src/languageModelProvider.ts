@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
 import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, CompletedToolCall, OpenAIUsage, OpenAIResponseMetadata, ChatMessageContentPart, OpenAIRequestOptions } from './openaiClient';
 import { API_KEY_SECRET_KEY, CACHED_MODELS_KEY } from './constants';
@@ -20,6 +21,8 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
     private modelList: ModelInformation[] = [];
     private _onDidChangeLanguageModelChatInformation = new vscode.EventEmitter<void>();
     private tokensPerChar = 0.25;
+    private readonly tokenCountCache = new Map<string, number>();
+    private readonly tokenCountCacheMaxEntries = 256;
     
     readonly onDidChangeLanguageModelChatInformation = this._onDidChangeLanguageModelChatInformation.event;
 
@@ -569,7 +572,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             : null;
 
         // Stream the response
-        await this.client.streamChatCompletion(
+        const responseText = await this.client.streamChatCompletion(
             chatMessages,
             model.modelId,
             {
@@ -594,9 +597,9 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                         progress.report(new vscode.LanguageModelTextPart(chunk));
                     }
                 },
-                onThinkingChunk: (chunk) => {
+                onThinkingChunk: (chunk, metadata) => {
                     // Report thinking/reasoning content using LanguageModelThinkingPart
-                    progress.report(new vscode.LanguageModelThinkingPart(chunk));
+                    progress.report(new vscode.LanguageModelThinkingPart(chunk, undefined, metadata));
                 },
                 suppressChainOfThought,
                 useResponsesApi,
@@ -628,11 +631,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     }
                 },
                 onUsage: (usage) => {
-                    const inputChars = chatMessages.reduce((sum, msg) => sum + this.getContentTextLength(msg.content), 0);
                     responseUsage = usage;
-                    if (inputChars > 0 && usage.prompt_tokens > 0) {
-                        this.tokensPerChar = usage.prompt_tokens / inputChars;
-                    }
                 },
                 onResponseMetadata: (metadata) => {
                     responseMetadata = metadata;
@@ -670,6 +669,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         }
 
         if (responseUsage) {
+            this.rememberApiUsageTokenCounts(chatMessages, responseText, responseUsage);
             progress.report(this.createUsageDataPart(responseUsage));
         }
         if (responseMetadata) {
@@ -793,14 +793,94 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         return undefined;
     }
 
-    private getContentTextLength(content: ChatMessage['content']): number {
+    private getContentText(content: ChatMessage['content']): string {
         if (typeof content === 'string') {
-            return content.length;
+            return content;
         }
         if (!Array.isArray(content)) {
-            return 0;
+            return '';
         }
-        return content.reduce((sum, part) => sum + (part.type === 'text' ? part.text.length : 0), 0);
+        return content
+            .filter((part): part is { type: 'text'; text: string } => part.type === 'text')
+            .map(part => part.text)
+            .join('');
+    }
+
+    private getContentTextLength(content: ChatMessage['content']): number {
+        return this.getContentText(content).length;
+    }
+
+    private getTokenCountCacheKey(textContent: string): string | undefined {
+        if (!textContent) {
+            return undefined;
+        }
+        return createHash('sha256').update(textContent).digest('hex');
+    }
+
+    private rememberTokenCount(textContent: string, tokenCount: number): void {
+        const key = this.getTokenCountCacheKey(textContent);
+        if (!key || !Number.isFinite(tokenCount) || tokenCount < 0) {
+            return;
+        }
+
+        if (this.tokenCountCache.has(key)) {
+            this.tokenCountCache.delete(key);
+        }
+        this.tokenCountCache.set(key, Math.ceil(tokenCount));
+
+        while (this.tokenCountCache.size > this.tokenCountCacheMaxEntries) {
+            const oldestKey = this.tokenCountCache.keys().next().value;
+            if (oldestKey === undefined) {
+                break;
+            }
+            this.tokenCountCache.delete(oldestKey);
+        }
+    }
+
+    private getCachedTokenCount(textContent: string): number | undefined {
+        const key = this.getTokenCountCacheKey(textContent);
+        if (!key) {
+            return undefined;
+        }
+
+        const tokenCount = this.tokenCountCache.get(key);
+        if (tokenCount === undefined) {
+            return undefined;
+        }
+
+        this.tokenCountCache.delete(key);
+        this.tokenCountCache.set(key, tokenCount);
+        return tokenCount;
+    }
+
+    private getVisibleCompletionTokenCount(usage: OpenAIUsage): number | undefined {
+        const reasoningTokens = usage.completion_tokens_details?.reasoning_tokens ?? 0;
+        const visibleCompletionTokens = usage.completion_tokens - reasoningTokens;
+        return visibleCompletionTokens > 0 ? visibleCompletionTokens : undefined;
+    }
+
+    private rememberApiUsageTokenCounts(chatMessages: ChatMessage[], responseText: string, usage: OpenAIUsage): void {
+        const promptTexts = chatMessages
+            .map(msg => this.getContentText(msg.content))
+            .filter(text => text.length > 0);
+        const promptText = promptTexts.join('');
+
+        if (promptText && usage.prompt_tokens > 0) {
+            this.rememberTokenCount(promptText, usage.prompt_tokens);
+        }
+        if (promptTexts.length === 1 && usage.prompt_tokens > 0) {
+            this.rememberTokenCount(promptTexts[0], usage.prompt_tokens);
+        }
+
+        const inputChars = promptText.length;
+        if (inputChars > 0 && usage.prompt_tokens > 0) {
+            this.tokensPerChar = usage.prompt_tokens / inputChars;
+        }
+
+        const visibleCompletionTokens = this.getVisibleCompletionTokenCount(usage);
+        if (responseText && visibleCompletionTokens !== undefined) {
+            this.rememberTokenCount(responseText, visibleCompletionTokens);
+        }
     }
 
     /**
@@ -1187,6 +1267,11 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             }
         }
         
+        const cachedTokenCount = this.getCachedTokenCount(textContent);
+        if (cachedTokenCount !== undefined) {
+            return cachedTokenCount;
+        }
+
         return Math.ceil(textContent.length * this.tokensPerChar);
     }
 
