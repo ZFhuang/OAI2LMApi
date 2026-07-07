@@ -20,7 +20,7 @@ import { GEMINI_API_KEY_SECRET_KEY, GEMINI_CACHED_MODELS_KEY } from './constants
 import { getModelMetadata } from './modelMetadata';
 import { stripSchemaField } from './schemaUtils';
 import { generateXmlToolPrompt, formatToolCallAsXml, formatToolResultAsText, XmlToolCallStreamParser, XmlToolParseOptions } from './xmlToolPrompt';
-import { getModelOverride } from './configUtils';
+import { getModelOverride, getEditTools } from './configUtils';
 import { logger } from './logger';
 import { modelsDevRegistry } from './modelsDevClient';
 
@@ -241,7 +241,9 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
             multiplierNumeric,
             capabilities: {
                 toolCalling: supportsToolCalling,
-                imageInput: supportsImageInput
+                imageInput: supportsImageInput,
+                editTools: getEditTools(supportsToolCalling),
+                editToolsHint: getEditTools(supportsToolCalling)
             }
         };
 

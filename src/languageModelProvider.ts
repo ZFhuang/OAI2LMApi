@@ -4,7 +4,7 @@ import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, Co
 import { API_KEY_SECRET_KEY, CACHED_MODELS_KEY } from './constants';
 import { getModelMetadata, isLLMModel, supportsToolCalling, ModelMetadata } from './modelMetadata';
 import { generateXmlToolPrompt, formatToolCallAsXml, formatToolResultAsText, XmlToolCallStreamParser, XmlToolParseOptions } from './xmlToolPrompt';
-import { getModelOverride } from './configUtils';
+import { getModelOverride, getEditTools } from './configUtils';
 import { logger } from './logger';
 import { modelsDevRegistry } from './modelsDevClient';
 
@@ -381,27 +381,6 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         return lines.join('\n');
     }
 
-    private getEditTools(apiModel: APIModelInfo, family: string): string[] | undefined {
-        const supportsEdits = apiModel.supported_parameters?.includes('tools')
-            || apiModel.supports_tools
-            || apiModel.supports_tool_use
-            || apiModel.supports_function_calling
-            || apiModel.supportsToolCall
-            || apiModel.capabilities?.tools
-            || apiModel.capabilities?.tool_use
-            || apiModel.capabilities?.function_calling
-            || apiModel.capabilities?.tool_calling;
-        if (!supportsEdits) {
-            return undefined;
-        }
-
-        const normalizedFamily = family.toLowerCase();
-        if (normalizedFamily.includes('gpt') || normalizedFamily.includes('o3') || normalizedFamily.includes('o4')) {
-            return ['apply-patch', 'multi-find-replace', 'find-replace', 'code-rewrite'];
-        }
-        return ['multi-find-replace', 'find-replace', 'code-rewrite'];
-    }
-
     private addModel(apiModel: APIModelInfo) {
         const { metadata, fromApi } = this.getModelInfo(apiModel);
         const family = this.extractModelFamily(apiModel.id);
@@ -453,8 +432,8 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             capabilities: {
                 toolCalling: supportsToolCalling,
                 imageInput: supportsImageInput,
-                editTools: this.getEditTools(apiModel, family),
-                editToolsHint: this.getEditTools(apiModel, family)
+                editTools: getEditTools(supportsToolCalling),
+                editToolsHint: getEditTools(supportsToolCalling)
             }
         };
 

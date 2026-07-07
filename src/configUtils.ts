@@ -94,6 +94,42 @@ function collectMatchingOverrides(modelId: string, overrides: ModelOverrideMap):
 }
 
 /**
+ * The complete set of edit tool names recognized by VSCode/Copilot editing flows.
+ *
+ * These are returned as a hint to the editor when a model supports tool calling.
+ * VSCode will make all recognized tools available to the model and its
+ * `EditToolLearningService` will automatically disable tools that perform
+ * poorly for a given model, so it is safe to declare all tools unconditionally.
+ *
+ * See the JSDoc on `LanguageModelChatCapabilities.editTools` in
+ * `vscode.proposed.chatProvider.d.ts`:
+ * "If not provided or if none of the tools are recognized, the editor will try
+ * multiple edit tools and pick the best one. ... all of the recognized edit
+ * tools will be made available to the model."
+ */
+export const ALL_EDIT_TOOLS: readonly string[] = [
+    'apply-patch',
+    'multi-find-replace',
+    'find-replace',
+    'code-rewrite'
+];
+
+/**
+ * Returns the edit tools to declare for a model.
+ *
+ * When the model supports tool calling, all recognized edit tools are returned
+ * so VSCode/Copilot can pick the best one at runtime (and learn from past
+ * attempts). When the model does not support tool calling, `undefined` is
+ * returned so the editor falls back to its default behavior.
+ *
+ * @param supportsToolCalling - whether the model supports tool/function calling
+ * @returns the list of edit tool names, or `undefined` if tool calling is unsupported
+ */
+export function getEditTools(supportsToolCalling: boolean): string[] | undefined {
+    return supportsToolCalling ? [...ALL_EDIT_TOOLS] : undefined;
+}
+
+/**
  * Gets model override configuration for a given model ID from VSCode settings.
  * Supports wildcard patterns like 'gpt-*' with case-insensitive matching.
  * 

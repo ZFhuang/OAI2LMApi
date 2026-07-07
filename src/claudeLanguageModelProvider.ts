@@ -3,7 +3,7 @@ import { ClaudeClient, ClaudeModelInfo, ClaudeToolDefinition, ClaudeCompletedToo
 import { CLAUDE_API_KEY_SECRET_KEY, CLAUDE_CACHED_MODELS_KEY } from './constants';
 import { getModelMetadata, isLLMModel, ModelMetadata } from './modelMetadata';
 import { generateXmlToolPrompt, formatToolCallAsXml, formatToolResultAsText, XmlToolCallStreamParser, XmlToolParseOptions } from './xmlToolPrompt';
-import { getModelOverride } from './configUtils';
+import { getModelOverride, getEditTools } from './configUtils';
 import { logger } from './logger';
 import { modelsDevRegistry } from './modelsDevClient';
 
@@ -189,7 +189,9 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
             multiplierNumeric,
             capabilities: {
                 toolCalling: supportsToolCalling,
-                imageInput: supportsImageInput
+                imageInput: supportsImageInput,
+                editTools: getEditTools(supportsToolCalling),
+                editToolsHint: getEditTools(supportsToolCalling)
             }
         };
 
