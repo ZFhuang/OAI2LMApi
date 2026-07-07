@@ -15,7 +15,9 @@
     "pnpm": ">=10.0.0"
   },
   "enabledApiProposals": [
-    "chatProvider"
+    "chatProvider",
+    "languageModelPricing",
+    "languageModelThinkingPart"
   ],
   "categories": [
     "AI",

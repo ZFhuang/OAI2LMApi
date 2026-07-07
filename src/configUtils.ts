@@ -11,6 +11,28 @@ export interface ModelOverrideConfig {
      * Numeric cost/scale multiplier shown by VS Code/Copilot model picker surfaces.
      */
     multiplierNumeric?: number;
+    /** Display pricing label, e.g. "Free", "2x", "$0.01/request". */
+    pricing?: string;
+    /** Input cost in credits per 1M tokens. */
+    inputCost?: number;
+    /** Output cost in credits per 1M tokens. */
+    outputCost?: number;
+    /** Cached input (read) cost in credits per 1M tokens. */
+    cacheCost?: number;
+    /** Cache write cost in credits per 1M tokens. */
+    cacheWriteCost?: number;
+    /** Long-context input cost (only when differs from default). */
+    longContextInputCost?: number;
+    /** Long-context output cost (only when differs from default). */
+    longContextOutputCost?: number;
+    /** Long-context cache read cost (only when differs from default). */
+    longContextCacheCost?: number;
+    /** Long-context cache write cost (only when differs from default). */
+    longContextCacheWriteCost?: number;
+    /** Relative pricing category: "low" | "medium" | "high" | "very_high". */
+    priceCategory?: string;
+    /** Model tier: "lightweight" | "versatile" | "powerful". */
+    category?: string;
     supportsToolCalling?: boolean;
     supportsImageInput?: boolean;
     /**
@@ -21,6 +43,19 @@ export interface ModelOverrideConfig {
      * Thinking level: number for token budget, or 'low'/'medium'/'high'/'auto'/'none'.
      */
     thinkingLevel?: string | number;
+    /**
+     * Reasoning effort levels the model supports, used to build the configurationSchema.
+     */
+    supportedReasoningEfforts?: string[];
+    /**
+     * Default reasoning effort for the model.
+     */
+    defaultReasoningEffort?: string;
+    /**
+     * Body shape for reasoning effort: "chat" (top-level `reasoning_effort`) or
+     * "responses" (nested `reasoning.effort`). Defaults to "chat".
+     */
+    reasoningEffortFormat?: 'chat' | 'responses';
     /**
      * When enabled, tools are converted to XML-format instructions in the system prompt
      * instead of using native function calling.

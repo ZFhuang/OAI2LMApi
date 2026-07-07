@@ -9,6 +9,12 @@ export interface OpenAIConfig {
 /**
  * Model information returned from the /v1/models API.
  * Extended with optional fields that some providers include.
+ *
+ * Pricing fields mirror the VS Code proposed `LanguageModelChatInformation`
+ * (see `vscode.proposed.languageModelPricing.d.ts`) so that values reported by
+ * gateways (OpenRouter, CodeBuddy-style, custom proxies) can be surfaced to
+ * the model picker hover. Costs are expressed in credits per 1M tokens, the
+ * same unit VS Code renders in the hover.
  */
 export interface APIModelInfo {
     id: string;
@@ -61,6 +67,35 @@ export interface APIModelInfo {
         tools?: boolean;
         reasoning?: boolean;
     };
+    // --- Pricing / cost fields (credits per 1M tokens) ---
+    /** Display pricing label, e.g. "Free", "2x", "$0.01/request". */
+    pricing?: string;
+    /** Input cost in credits per 1M tokens. */
+    inputCost?: number;
+    /** Output cost in credits per 1M tokens. */
+    outputCost?: number;
+    /** Cached input (read) cost in credits per 1M tokens. */
+    cacheCost?: number;
+    /** Cache write cost in credits per 1M tokens. */
+    cacheWriteCost?: number;
+    /** Long-context input cost (only when differs from default). */
+    longContextInputCost?: number;
+    /** Long-context output cost (only when differs from default). */
+    longContextOutputCost?: number;
+    /** Long-context cache read cost (only when differs from default). */
+    longContextCacheCost?: number;
+    /** Long-context cache write cost (only when differs from default). */
+    longContextCacheWriteCost?: number;
+    /** Relative pricing category: "low" | "medium" | "high" | "very_high". */
+    priceCategory?: string;
+    /** Model tier: "lightweight" | "versatile" | "powerful". */
+    category?: string;
+    /** Reasoning effort levels supported by the model (e.g. ["low","medium","high"]). */
+    supportedReasoningEfforts?: string[];
+    /** Default reasoning effort for the model. */
+    defaultReasoningEffort?: string;
+    /** Body shape for reasoning effort: "chat" (top-level) or "responses" (nested). */
+    reasoningEffortFormat?: 'chat' | 'responses';
 }
 
 /**
@@ -154,6 +189,13 @@ export interface OpenAIRequestOptions {
     includeReasoning?: boolean;
     responseFormat?: Record<string, unknown>;
     serviceTier?: string;
+    /**
+     * Body shape for reasoning effort.
+     * - "chat" (default): top-level `reasoning_effort` field (OpenAI Chat Completions, OpenRouter).
+     * - "responses": nested `reasoning.effort` field (OpenAI Responses API style).
+     * When unset, the client falls back to top-level `reasoning` (OpenRouter passthrough).
+     */
+    reasoningEffortFormat?: 'chat' | 'responses';
 }
 
 // Type-safe message format for OpenAI API
@@ -1575,7 +1617,7 @@ export class OpenAIClient {
             extras['stop'] = options.stop;
         }
         if (options.reasoning) {
-            extras['reasoning'] = options.reasoning;
+            this.applyReasoningExtras(extras, options.reasoning, options.reasoningEffortFormat);
         }
         if (typeof options.includeReasoning === 'boolean') {
             extras['include_reasoning'] = options.includeReasoning;
@@ -1586,6 +1628,73 @@ export class OpenAIClient {
         if (options.serviceTier) {
             extras['service_tier'] = options.serviceTier;
         }
+    }
+
+    /**
+     * Writes reasoning-related extras onto the request body according to the
+     * model's `reasoningEffortFormat`.
+     *
+     * - "chat": emits a top-level `reasoning_effort` string when an effort is
+     *   present (OpenAI Chat Completions, OpenRouter). Any other keys on the
+     *   reasoning object are forwarded under `reasoning` as a fallback so
+     *   providers that accept the OpenRouter-style `reasoning` object still work.
+     * - "responses": emits a nested `reasoning` object with `{ effort }`
+     *   (OpenAI Responses API style).
+     * - unset: forwards the entire `reasoning` object verbatim (OpenRouter
+     *   passthrough — the historical behavior).
+     */
+    private applyReasoningExtras(
+        extras: Record<string, unknown>,
+        reasoning: Record<string, unknown>,
+        format: 'chat' | 'responses' | undefined
+    ): void {
+        const effort = typeof reasoning['effort'] === 'string' ? reasoning['effort'] : undefined;
+        const enabled = reasoning['enabled'];
+        const maxTokens = reasoning['max_tokens'];
+
+        if (format === 'responses') {
+            const nested: Record<string, unknown> = {};
+            if (effort !== undefined) {
+                nested['effort'] = effort;
+            }
+            if (enabled !== undefined) {
+                nested['enabled'] = enabled;
+            }
+            if (typeof maxTokens === 'number' && Number.isFinite(maxTokens)) {
+                nested['max_tokens'] = maxTokens;
+            }
+            // Merge any extra keys the provider sent through `reasoning`.
+            for (const [key, value] of Object.entries(reasoning)) {
+                if (key !== 'effort' && key !== 'enabled' && key !== 'max_tokens') {
+                    nested[key] = value;
+                }
+            }
+            if (Object.keys(nested).length > 0) {
+                extras['reasoning'] = nested;
+            }
+            return;
+        }
+
+        if (format === 'chat') {
+            if (effort !== undefined) {
+                extras['reasoning_effort'] = effort;
+            }
+            // Forward non-effort keys as a top-level `reasoning` object for
+            // providers that accept the OpenRouter-style shape (e.g. enabled, max_tokens).
+            const passthrough: Record<string, unknown> = {};
+            for (const [key, value] of Object.entries(reasoning)) {
+                if (key !== 'effort') {
+                    passthrough[key] = value;
+                }
+            }
+            if (Object.keys(passthrough).length > 0) {
+                extras['reasoning'] = passthrough;
+            }
+            return;
+        }
+
+        // Unset: passthrough the whole object (OpenRouter style).
+        extras['reasoning'] = reasoning;
     }
 
     /**

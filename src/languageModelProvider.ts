@@ -13,6 +13,12 @@ interface ModelInformation extends vscode.LanguageModelChatInformation {
     supportedParameters?: string[];
     defaultParameters?: Record<string, unknown>;
     supportsReasoning?: boolean;
+    /** Reasoning effort levels supported by the model (e.g. ["low","medium","high"]). */
+    supportedReasoningEfforts?: string[];
+    /** Default reasoning effort for the model. */
+    defaultReasoningEffort?: string;
+    /** Body shape for reasoning effort: "chat" (top-level) or "responses" (nested). */
+    reasoningEffortFormat?: 'chat' | 'responses';
 }
 
 export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProvider<ModelInformation>, vscode.Disposable {
@@ -344,7 +350,18 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             apiModel.credits,
             apiModel.architecture?.modality
         ].filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
-        return parts.length > 0 ? parts.join(' | ') : undefined;
+        if (parts.length > 0) {
+            return parts.join(' | ');
+        }
+        // Fallback: use the first line of description (truncated) when no short
+        // labels are available, so the model picker still shows a meaningful subtitle.
+        if (typeof apiModel.description === 'string') {
+            const firstLine = apiModel.description.split(/\r?\n/)[0]?.trim();
+            if (firstLine) {
+                return firstLine.length > 80 ? `${firstLine.slice(0, 77)}...` : firstLine;
+            }
+        }
+        return undefined;
     }
 
     private getModelTooltip(
@@ -389,11 +406,29 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         let maxOutputTokens = metadata.maxOutputTokens;
         let supportsToolCalling = metadata.supportsToolCalling;
         let supportsImageInput = metadata.supportsImageInput;
-        let multiplierNumeric = this.getCreditMultiplier(apiModel) ?? 1;
+        let multiplierNumeric = this.getCreditMultiplier(apiModel);
         const supportsReasoning = apiModel.supports_reasoning === true
             || apiModel.supportsReasoning === true
             || apiModel.capabilities?.reasoning === true
             || typeof apiModel.default_parameters?.['reasoning'] === 'object';
+
+        // Pricing / cost fields — prefer API-provided values, fall back to overrides.
+        let pricing = apiModel.pricing;
+        let inputCost = apiModel.inputCost;
+        let outputCost = apiModel.outputCost;
+        let cacheCost = apiModel.cacheCost;
+        let cacheWriteCost = apiModel.cacheWriteCost;
+        let longContextInputCost = apiModel.longContextInputCost;
+        let longContextOutputCost = apiModel.longContextOutputCost;
+        let longContextCacheCost = apiModel.longContextCacheCost;
+        let longContextCacheWriteCost = apiModel.longContextCacheWriteCost;
+        let priceCategory = apiModel.priceCategory;
+        let category = apiModel.category;
+
+        // Reasoning effort configuration — prefer API, fall back to overrides.
+        let supportedReasoningEfforts = apiModel.supportedReasoningEfforts;
+        let defaultReasoningEffort = apiModel.defaultReasoningEffort;
+        let reasoningEffortFormat = apiModel.reasoningEffortFormat;
 
         const override = getModelOverride(apiModel.id, 'openai');
         if (override) {
@@ -412,7 +447,61 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             if (typeof override.multiplierNumeric === 'number' && Number.isFinite(override.multiplierNumeric)) {
                 multiplierNumeric = override.multiplierNumeric;
             }
+            if (typeof override.pricing === 'string') {
+                pricing = override.pricing;
+            }
+            if (typeof override.inputCost === 'number') {
+                inputCost = override.inputCost;
+            }
+            if (typeof override.outputCost === 'number') {
+                outputCost = override.outputCost;
+            }
+            if (typeof override.cacheCost === 'number') {
+                cacheCost = override.cacheCost;
+            }
+            if (typeof override.cacheWriteCost === 'number') {
+                cacheWriteCost = override.cacheWriteCost;
+            }
+            if (typeof override.longContextInputCost === 'number') {
+                longContextInputCost = override.longContextInputCost;
+            }
+            if (typeof override.longContextOutputCost === 'number') {
+                longContextOutputCost = override.longContextOutputCost;
+            }
+            if (typeof override.longContextCacheCost === 'number') {
+                longContextCacheCost = override.longContextCacheCost;
+            }
+            if (typeof override.longContextCacheWriteCost === 'number') {
+                longContextCacheWriteCost = override.longContextCacheWriteCost;
+            }
+            if (typeof override.priceCategory === 'string') {
+                priceCategory = override.priceCategory;
+            }
+            if (typeof override.category === 'string') {
+                category = override.category;
+            }
+            if (Array.isArray(override.supportedReasoningEfforts) && override.supportedReasoningEfforts.length > 0) {
+                supportedReasoningEfforts = override.supportedReasoningEfforts;
+            }
+            if (typeof override.defaultReasoningEffort === 'string') {
+                defaultReasoningEffort = override.defaultReasoningEffort;
+            }
+            if (override.reasoningEffortFormat === 'chat' || override.reasoningEffortFormat === 'responses') {
+                reasoningEffortFormat = override.reasoningEffortFormat;
+            }
         }
+
+        // Build a display pricing label when one wasn't provided but a multiplier is known.
+        if (!pricing && typeof multiplierNumeric === 'number' && Number.isFinite(multiplierNumeric)) {
+            pricing = `${multiplierNumeric}x`;
+        }
+
+        // Build a configuration schema so VS Code can surface reasoning effort in the picker.
+        const configurationSchema = this.buildConfigurationSchema(
+            supportsReasoning,
+            supportedReasoningEfforts,
+            defaultReasoningEffort
+        );
 
         const modelInfo: ModelInformation = {
             modelId: apiModel.id,
@@ -426,9 +515,25 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             maxOutputTokens,
             multiplierNumeric,
             isUserSelectable: true,
+            isBYOK: true,
+            ...(pricing !== undefined ? { pricing } : {}),
+            ...(inputCost !== undefined ? { inputCost } : {}),
+            ...(outputCost !== undefined ? { outputCost } : {}),
+            ...(cacheCost !== undefined ? { cacheCost } : {}),
+            ...(cacheWriteCost !== undefined ? { cacheWriteCost } : {}),
+            ...(longContextInputCost !== undefined ? { longContextInputCost } : {}),
+            ...(longContextOutputCost !== undefined ? { longContextOutputCost } : {}),
+            ...(longContextCacheCost !== undefined ? { longContextCacheCost } : {}),
+            ...(longContextCacheWriteCost !== undefined ? { longContextCacheWriteCost } : {}),
+            ...(priceCategory !== undefined ? { priceCategory } : {}),
+            ...(category !== undefined ? { category } : {}),
+            ...(configurationSchema ? { configurationSchema } : {}),
             supportedParameters: apiModel.supported_parameters,
             defaultParameters: apiModel.default_parameters,
             supportsReasoning,
+            ...(supportedReasoningEfforts ? { supportedReasoningEfforts } : {}),
+            ...(defaultReasoningEffort ? { defaultReasoningEffort } : {}),
+            ...(reasoningEffortFormat ? { reasoningEffortFormat } : {}),
             capabilities: {
                 toolCalling: supportsToolCalling,
                 imageInput: supportsImageInput,
@@ -441,6 +546,42 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         const source = fromApi ? 'API' : 'registry';
         const hasOverride = override ? ' (with overrides)' : '';
         logger.debug(`Added model: ${modelInfo.id} (family: ${family}, source: ${source})${hasOverride}`, undefined, 'OpenAI');
+    }
+
+    /**
+     * Builds a `LanguageModelConfigurationSchema` exposing reasoning effort as a
+     * primary picker action (group: 'navigation') for models that support reasoning.
+     * Mirrors the schema built by VS Code's built-in BYOK providers
+     * (see `claudeCodeModels.ts` / `copilotCli.ts`).
+     */
+    private buildConfigurationSchema(
+        supportsReasoning: boolean,
+        supportedReasoningEfforts: string[] | undefined,
+        defaultReasoningEffort: string | undefined
+    ): vscode.LanguageModelConfigurationSchema | undefined {
+        if (!supportsReasoning) {
+            return undefined;
+        }
+
+        // Default effort levels when the provider didn't enumerate them.
+        const effortLevels = supportedReasoningEfforts && supportedReasoningEfforts.length > 0
+            ? supportedReasoningEfforts
+            : ['low', 'medium', 'high'];
+        const defaultEffort = defaultReasoningEffort
+            ?? (effortLevels.includes('high') ? 'high' : effortLevels[effortLevels.length - 1]);
+
+        return {
+            properties: {
+                reasoningEffort: {
+                    type: 'string',
+                    title: 'Thinking Effort',
+                    enum: effortLevels,
+                    enumItemLabels: effortLevels.map(level => level.charAt(0).toUpperCase() + level.slice(1)),
+                    default: defaultEffort,
+                    group: 'navigation'
+                }
+            }
+        };
     }
 
     async provideLanguageModelChatInformation(
@@ -706,7 +847,8 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             ...(reasoning !== undefined ? { reasoning } : {}),
             ...(includeReasoning !== undefined ? { includeReasoning } : {}),
             ...(responseFormat !== undefined ? { responseFormat } : {}),
-            ...(serviceTier !== undefined ? { serviceTier } : {})
+            ...(serviceTier !== undefined ? { serviceTier } : {}),
+            ...(model.reasoningEffortFormat ? { reasoningEffortFormat: model.reasoningEffortFormat } : {})
         };
     }
 
