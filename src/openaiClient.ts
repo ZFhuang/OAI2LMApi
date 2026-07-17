@@ -1094,12 +1094,38 @@ export class OpenAIClient {
                         }
                     }
                 }
+
+                // Flush tool calls as soon as the stream signals completion (finish_reason === 'tool_calls').
+                // Reporting during streaming (before VSCode finalizes the response) ensures the
+                // LanguageModelToolCallPart parts are persisted into the response rather than
+                // being dropped as late-arriving parts after stream finalize.
+                if (finishReason === 'tool_calls' && toolCallsInProgress.size > 0 && streamOptions.onToolCallsComplete) {
+                    const flushed: CompletedToolCall[] = [];
+                    const flushedSeen = new Set<string>();
+                    const sortedFlushed = Array.from(toolCallsInProgress.entries()).sort((a, b) => a[0] - b[0]);
+                    for (const [, toolCall] of sortedFlushed) {
+                        if (toolCall.id && toolCall.name && !flushedSeen.has(toolCall.id)) {
+                            flushedSeen.add(toolCall.id);
+                            flushed.push({
+                                id: toolCall.id,
+                                name: toolCall.name,
+                                arguments: toolCall.arguments
+                            });
+                        }
+                    }
+                    if (flushed.length > 0) {
+                        streamOptions.onToolCallsComplete(flushed);
+                    }
+                    toolCallsInProgress.clear();
+                }
             }
 
             // Flush any pending partial tag/text at end of stream.
             thinkTagParser.flush();
 
-            // Report all completed tool calls at once after streaming is done
+            // Report all completed tool calls at once after streaming is done.
+            // NOTE: if tool calls were already flushed during streaming (finish_reason === 'tool_calls'),
+            // toolCallsInProgress has been cleared and this block is a no-op.
             const completedToolCalls: CompletedToolCall[] = [];
             if (toolCallsInProgress.size > 0) {
                 const seenIds = new Set<string>();
