@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 import * as vscode from 'vscode';
-import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, CompletedToolCall, OpenAIUsage, OpenAIResponseMetadata, ChatMessageContentPart, OpenAIRequestOptions } from './openaiClient';
+import { OpenAIClient, ChatMessage, APIModelInfo, ToolDefinition, ToolChoice, ToolCallChunk, CompletedToolCall, OpenAIUsage, OpenAIResponseMetadata, ChatMessageContentPart, OpenAIRequestOptions } from './openaiClient';
 import { API_KEY_SECRET_KEY, CACHED_MODELS_KEY } from './constants';
 import { getModelMetadata, isLLMModel, supportsToolCalling, ModelMetadata } from './modelMetadata';
 import { generateXmlToolPrompt, formatToolCallAsXml, formatToolResultAsText, XmlToolCallStreamParser, XmlToolParseOptions } from './xmlToolPrompt';
@@ -719,7 +719,15 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                 },
                 onThinkingChunk: (chunk, metadata) => {
                     // Report thinking/reasoning content using LanguageModelThinkingPart
-                    progress.report(new vscode.LanguageModelThinkingPart(chunk, undefined, metadata));
+                    progress.report(new vscode.LanguageModelThinkingPart(chunk, this.getThinkingIdFromMetadata(metadata), metadata));
+                },
+                onToolCallStarted: (toolCall) => {
+                    logger.debug(`Streaming native tool call started: ${toolCall.name}`, {
+                        id: toolCall.id
+                    }, 'OpenAI');
+                },
+                onToolCall: (toolCall) => {
+                    this.tryReportNativeToolCall(toolCall, reportedToolCallIds, progress);
                 },
                 suppressChainOfThought,
                 useResponsesApi,
@@ -797,6 +805,42 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         }
     }
 
+    private tryReportNativeToolCall(
+        toolCall: ToolCallChunk | CompletedToolCall,
+        reportedToolCallIds: Set<string>,
+        progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
+    ): boolean {
+        if (!toolCall.id || reportedToolCallIds.has(toolCall.id)) {
+            return false;
+        }
+
+        const parsedArgs = this.tryParseToolCallArguments(toolCall.arguments);
+        if (!parsedArgs) {
+            return false;
+        }
+
+        reportedToolCallIds.add(toolCall.id);
+        progress.report(new vscode.LanguageModelToolCallPart(
+            toolCall.id,
+            toolCall.name,
+            parsedArgs
+        ));
+        logger.debug(`Streaming native tool call emitted early: ${toolCall.name}`, undefined, 'OpenAI');
+        return true;
+    }
+
+    private tryParseToolCallArguments(argumentsJson: string): Record<string, unknown> | undefined {
+        try {
+            const parsed = JSON.parse(argumentsJson || '{}');
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                return parsed as Record<string, unknown>;
+            }
+        } catch {
+            return undefined;
+        }
+        return undefined;
+    }
+
     private createUsageDataPart(usage: OpenAIUsage): vscode.LanguageModelDataPart {
         return new vscode.LanguageModelDataPart(
             new TextEncoder().encode(JSON.stringify(usage)),
@@ -809,6 +853,19 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             new TextEncoder().encode(JSON.stringify(metadata)),
             'openai.response_metadata'
         );
+    }
+
+    private getThinkingIdFromMetadata(metadata: Record<string, unknown> | undefined): string | undefined {
+        if (!metadata) {
+            return undefined;
+        }
+        for (const key of ['cot_id', 'reasoning_opaque', 'reasoning_signature', 'signature', 'id']) {
+            const value = metadata[key];
+            if (typeof value === 'string' && value.length > 0) {
+                return value;
+            }
+        }
+        return undefined;
     }
 
     private buildRequestOptions(
@@ -1024,10 +1081,23 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                 const toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }> = [];
                 const toolResults: Array<{ tool_call_id: string; content: string; toolName?: string }> = [];
                 let textContent = '';
+                let thinkingContent = '';
+                let thinkingId: string | undefined;
+                let thinkingMetadata: Record<string, unknown> | undefined;
                 const contentParts: ChatMessageContentPart[] = [];
 
                 for (const part of msg.content) {
-                    if (this.isToolCallPart(part)) {
+                    if (this.isThinkingPart(part)) {
+                        const thinkingText = this.extractThinkingContent(part);
+                        if (thinkingText) {
+                            thinkingContent += thinkingText;
+                        }
+                        thinkingId ??= this.getThinkingId(part);
+                        thinkingMetadata = {
+                            ...(thinkingMetadata ?? {}),
+                            ...(part.metadata ?? {})
+                        };
+                    } else if (this.isToolCallPart(part)) {
                         // Ensure we have a valid tool call ID
                         const toolCallId = this.ensureToolCallId(part.callId, part.name, toolCallIndex++);
                         
@@ -1083,6 +1153,11 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     }
                 }
 
+                const reasoningFields = role === 'assistant'
+                    ? this.buildReasoningChatFields(thinkingContent, thinkingId, thinkingMetadata)
+                    : {};
+                const hasReasoningFields = Object.keys(reasoningFields).length > 0;
+
                 // Handle tool calls and results based on mode
                 if (usePromptBasedToolCalling) {
                     // For prompt-based tool calling, everything is text.
@@ -1104,7 +1179,14 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     if (textContent.trim()) {
                         result.push({
                             role,
-                            content: textContent.trim()
+                            content: textContent.trim(),
+                            ...reasoningFields
+                        });
+                    } else if (role === 'assistant' && hasReasoningFields) {
+                        result.push({
+                            role: 'assistant',
+                            content: null,
+                            ...reasoningFields
                         });
                     }
                 } else {
@@ -1114,7 +1196,8 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                         result.push({
                             role: 'assistant',
                             content: textContent || null,
-                            tool_calls: toolCalls
+                            tool_calls: toolCalls,
+                            ...reasoningFields
                         });
                     }
                     // If we have tool results, add them as separate tool messages
@@ -1133,7 +1216,14 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                             role,
                             content: role === 'user' && contentParts.some(part => part.type === 'image_url')
                                 ? this.mergeAdjacentTextParts(contentParts)
-                                : textContent
+                                : textContent,
+                            ...reasoningFields
+                        });
+                    } else if (role === 'assistant' && hasReasoningFields) {
+                        result.push({
+                            role: 'assistant',
+                            content: null,
+                            ...reasoningFields
                         });
                     }
                 }
@@ -1167,6 +1257,55 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             }
         }
         return merged;
+    }
+
+    private isThinkingPart(part: unknown): part is { value: string | string[]; id?: string; metadata?: Record<string, unknown> } {
+        return part instanceof vscode.LanguageModelThinkingPart;
+    }
+
+    private extractThinkingContent(part: { value: string | string[] }): string {
+        return Array.isArray(part.value) ? part.value.join('') : part.value;
+    }
+
+    private getThinkingId(part: { id?: string; metadata?: Record<string, unknown> }): string | undefined {
+        if (typeof part.id === 'string' && part.id.length > 0) {
+            return part.id;
+        }
+        const metadata = part.metadata;
+        if (!metadata) {
+            return undefined;
+        }
+        for (const key of ['cot_id', 'reasoning_opaque', 'reasoning_signature', 'signature', 'id']) {
+            const value = metadata[key];
+            if (typeof value === 'string' && value.length > 0) {
+                return value;
+            }
+        }
+        return undefined;
+    }
+
+    private buildReasoningChatFields(
+        thinkingContent: string,
+        thinkingId: string | undefined,
+        metadata: Record<string, unknown> | undefined
+    ): Partial<ChatMessage> {
+        if (!thinkingContent) {
+            return {};
+        }
+        const reasoningOpaque = typeof metadata?.['reasoning_opaque'] === 'string' ? metadata['reasoning_opaque'] : undefined;
+        const signature = typeof metadata?.['signature'] === 'string'
+            ? metadata['signature']
+            : typeof metadata?.['reasoning_signature'] === 'string'
+                ? metadata['reasoning_signature']
+                : undefined;
+        return {
+            ...(thinkingId ? { cot_id: thinkingId } : {}),
+            cot_summary: thinkingContent,
+            reasoning_content: thinkingContent,
+            reasoning: thinkingContent,
+            ...(reasoningOpaque ? { reasoning_opaque: reasoningOpaque } : {}),
+            ...(signature ? { signature } : {})
+        };
     }
 
     private extractContentPartsFromPart(part: unknown): ChatMessageContentPart[] {

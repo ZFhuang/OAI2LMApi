@@ -917,6 +917,167 @@ suite('OpenAIClient streamChatCompletion empty-stream and message tool_calls han
 		assert.strictEqual(toolCalls[0].arguments, '{"a":1}');
 	});
 
+	test('Should emit incremental callback for choices[0].message tool_calls', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		const incremental: ToolCallChunk[] = [];
+		const completed: CompletedToolCall[] = [];
+
+		const streamWithMessageToolCalls = async function* () {
+			yield {
+				choices: [
+					{
+						delta: {},
+						finish_reason: 'stop',
+						message: {
+							tool_calls: [
+								{
+									id: 'call_message',
+									type: 'function',
+									function: { name: 'edit_file', arguments: '{"filePath":"a.ts"}' }
+								}
+							]
+						}
+					}
+				]
+			};
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => streamWithMessageToolCalls()
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onToolCall: (toolCall) => incremental.push(toolCall),
+				onToolCallsComplete: (toolCalls) => completed.push(...toolCalls),
+				maxTokens: 100
+			}
+		);
+
+		assert.strictEqual(incremental.length, 1);
+		assert.strictEqual(incremental[0].id, 'call_message');
+		assert.strictEqual(incremental[0].name, 'edit_file');
+		assert.strictEqual(incremental[0].arguments, '{"filePath":"a.ts"}');
+		assert.strictEqual(completed.length, 1);
+	});
+
+	test('Should capture non-delta top-level choices[0].tool_calls during streaming', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		const incremental: ToolCallChunk[] = [];
+		const completed: CompletedToolCall[] = [];
+
+		const streamWithTopLevelToolCalls = async function* () {
+			yield {
+				choices: [
+					{
+						delta: {},
+						finish_reason: 'tool_calls',
+						tool_calls: [
+							{
+								id: 'call_top_level',
+								type: 'function',
+								function: { name: 'multi_replace_string_in_file', arguments: '{"replacements":[]}' }
+							}
+						]
+					}
+				]
+			};
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => streamWithTopLevelToolCalls()
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onToolCall: (toolCall) => incremental.push(toolCall),
+				onToolCallsComplete: (toolCalls) => completed.push(...toolCalls),
+				maxTokens: 100
+			}
+		);
+
+		assert.strictEqual(incremental.length, 1);
+		assert.strictEqual(incremental[0].id, 'call_top_level');
+		assert.strictEqual(incremental[0].name, 'multi_replace_string_in_file');
+		assert.strictEqual(incremental[0].arguments, '{"replacements":[]}');
+		assert.strictEqual(completed.length, 1);
+		assert.strictEqual(completed[0].id, 'call_top_level');
+	});
+
+	test('Should capture camelCase toolCalls during streaming', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		const completed: CompletedToolCall[] = [];
+
+		const streamWithCamelCaseToolCalls = async function* () {
+			yield {
+				choices: [
+					{
+						delta: {},
+						finish_reason: 'stop',
+						message: {
+							toolCalls: [
+								{
+									id: 'call_camel',
+									name: 'replace_string_in_file',
+									arguments: '{"filePath":"a.ts"}'
+								}
+							]
+						}
+					}
+				]
+			};
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => streamWithCamelCaseToolCalls()
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onToolCallsComplete: (toolCalls) => completed.push(...toolCalls),
+				maxTokens: 100
+			}
+		);
+
+		assert.strictEqual(completed.length, 1);
+		assert.strictEqual(completed[0].id, 'call_camel');
+		assert.strictEqual(completed[0].name, 'replace_string_in_file');
+		assert.strictEqual(completed[0].arguments, '{"filePath":"a.ts"}');
+	});
+
 	test('Should emit reasoning_content as thinking and not fall back to non-streaming', async () => {
 		const config: OpenAIConfig = {
 			apiEndpoint: 'https://example.com/v1',
@@ -1059,6 +1220,261 @@ suite('OpenAIClient streamChatCompletion empty-stream and message tool_calls han
 
 		assert.strictEqual(thinking.join(''), 'abc');
 		assert.strictEqual(calls.length, 1);
+	});
+
+	test('Should retransmit assistant reasoning_content on later chat completion requests', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		let capturedMessages: any[] = [];
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async (opts: any) => {
+						capturedMessages = opts.messages;
+						return (async function* () {
+							yield {
+								choices: [{
+									delta: { content: 'ok' },
+									finish_reason: 'stop'
+								}]
+							};
+						})();
+					}
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[
+				{ role: 'user', content: 'Use the tool' },
+				{
+					role: 'assistant',
+					content: null,
+					cot_id: 'reasoning-1',
+					reasoning_content: 'I should call the tool.',
+					tool_calls: [{
+						id: 'call_1',
+						type: 'function',
+						function: { name: 'read_file', arguments: '{"path":"a.ts"}' }
+					}]
+				},
+				{ role: 'tool', content: 'file contents', tool_call_id: 'call_1' }
+			],
+			'deepseek-reasoner',
+			{ maxTokens: 100 }
+		);
+
+		const assistantMessage = capturedMessages.find((m: any) => m.role === 'assistant');
+		assert.ok(assistantMessage, 'Assistant message should be sent');
+		assert.strictEqual(assistantMessage.cot_id, 'reasoning-1');
+		assert.strictEqual(assistantMessage.cot_summary, 'I should call the tool.');
+		assert.strictEqual(assistantMessage.reasoning_content, 'I should call the tool.');
+		assert.strictEqual(assistantMessage.reasoning, 'I should call the tool.');
+	});
+
+	test('Should recover accumulated content when stream ends with partial JSON parse error', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		let emitted = '';
+
+		const brokenStream = async function* () {
+			yield {
+				choices: [{
+					delta: { content: 'hello' },
+					finish_reason: null
+				}]
+			};
+			throw new SyntaxError('Unexpected end of JSON input');
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => brokenStream()
+				}
+			}
+		};
+
+		const result = await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onChunk: (chunk) => {
+					emitted += chunk;
+				},
+				maxTokens: 100
+			}
+		);
+
+		assert.strictEqual(emitted, 'hello');
+		assert.strictEqual(result, 'hello');
+	});
+
+	test('Should emit begin tool-call callback before completed tool calls', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		const started: string[] = [];
+		const completed: CompletedToolCall[] = [];
+
+		const streamWithToolCall = async function* () {
+			yield {
+				choices: [{
+					delta: {
+						tool_calls: [{
+							index: 0,
+							id: 'call_1',
+							type: 'function',
+							function: { name: 'read_file', arguments: '' }
+						}]
+					},
+					finish_reason: null
+				}]
+			};
+			yield {
+				choices: [{
+					delta: {
+						tool_calls: [{
+							index: 0,
+							function: { arguments: '{"path":"a.ts"}' }
+						}]
+					},
+					finish_reason: 'tool_calls'
+				}]
+			};
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => streamWithToolCall()
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onToolCallStarted: (toolCall) => started.push(`${toolCall.id}:${toolCall.name}`),
+				onToolCallsComplete: (toolCalls) => completed.push(...toolCalls),
+				maxTokens: 100
+			}
+		);
+
+		assert.deepStrictEqual(started, ['call_1:read_file']);
+		assert.strictEqual(completed.length, 1);
+		assert.strictEqual(completed[0].arguments, '{"path":"a.ts"}');
+	});
+
+	test('Should emit incremental tool call before finish_reason when arguments are parseable', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		const eventOrder: string[] = [];
+
+		const streamWithEarlyCompleteArguments = async function* () {
+			yield {
+				choices: [{
+					delta: {
+						tool_calls: [{
+							index: 0,
+							id: 'call_early',
+							type: 'function',
+							function: { name: 'multi_replace_string_in_file', arguments: '{"replacements":[]}' }
+						}]
+					},
+					finish_reason: null
+				}]
+			};
+			yield {
+				choices: [{
+					delta: { content: '' },
+					finish_reason: 'tool_calls'
+				}]
+			};
+		};
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async () => streamWithEarlyCompleteArguments()
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				onToolCall: (toolCall) => eventOrder.push(`incremental:${toolCall.id}`),
+				onToolCallsComplete: (toolCalls) => {
+					for (const toolCall of toolCalls) {
+						eventOrder.push(`complete:${toolCall.id}`);
+					}
+				},
+				maxTokens: 100
+			}
+		);
+
+		assert.deepStrictEqual(eventOrder, ['incremental:call_early', 'complete:call_early']);
+	});
+
+	test('Should add default object parameters to tools without schemas', async () => {
+		const config: OpenAIConfig = {
+			apiEndpoint: 'https://example.com/v1',
+			apiKey: 'test-key'
+		};
+
+		const client = new OpenAIClient(config);
+		let capturedTools: any[] = [];
+
+		(client as any).client = {
+			chat: {
+				completions: {
+					create: async (opts: any) => {
+						capturedTools = opts.tools;
+						return (async function* () {
+							yield {
+								choices: [{
+									delta: { content: 'ok' },
+									finish_reason: 'stop'
+								}]
+							};
+						})();
+					}
+				}
+			}
+		};
+
+		await client.streamChatCompletion(
+			[{ role: 'user', content: 'x' }],
+			'test-model',
+			{
+				tools: [{
+					type: 'function',
+					function: { name: 'no_params' }
+				}],
+				maxTokens: 100
+			}
+		);
+
+		assert.deepStrictEqual(capturedTools[0].function.parameters, { type: 'object', properties: {} });
 	});
 });
 

@@ -150,6 +150,14 @@ export interface ChatMessage {
     content: ChatMessageContent;
     tool_calls?: ToolCall[];
     tool_call_id?: string;
+    cot_id?: string;
+    cot_summary?: string;
+    reasoning_content?: string;
+    reasoning?: string;
+    reasoning_text?: string;
+    reasoning_opaque?: string;
+    thinking?: string;
+    signature?: string;
 }
 
 export interface OpenAIUsage {
@@ -222,6 +230,14 @@ export interface CompletedToolCall {
     id: string;
     name: string;
     arguments: string;
+}
+
+/**
+ * Represents the start of a streamed tool call before arguments have completed.
+ */
+export interface StartedToolCall {
+    id?: string;
+    name: string;
 }
 
 /**
@@ -533,6 +549,8 @@ export interface StreamOptions {
      * are reported together in a single batch.
      */
     onToolCallsComplete?: (toolCalls: CompletedToolCall[]) => void;
+    /** Called as soon as a streamed tool call name is known. */
+    onToolCallStarted?: (toolCall: StartedToolCall) => void;
     /** Called with token usage statistics after the API response completes. */
     onUsage?: (usage: OpenAIUsage) => void;
     /** Called with response metadata surfaced by OpenAI-compatible streaming chunks. */
@@ -570,6 +588,114 @@ export class OpenAIClient {
             return (value as string[]).join('');
         }
         return undefined;
+    }
+
+    private getString(value: unknown): string | undefined {
+        return typeof value === 'string' && value.length > 0 ? value : undefined;
+    }
+
+    private getThinkingTextFromRecord(record: Record<string, unknown> | undefined): string | undefined {
+        if (!record) {
+            return undefined;
+        }
+        return this.coerceThinkingText(record['cot_summary'])
+            ?? this.coerceThinkingText(record['reasoning_text'])
+            ?? this.coerceThinkingText(record['reasoning_content'])
+            ?? this.coerceThinkingText(record['reasoning'])
+            ?? this.coerceThinkingText(record['thinking']);
+    }
+
+    private getThinkingIdFromRecord(record: Record<string, unknown> | undefined): string | undefined {
+        if (!record) {
+            return undefined;
+        }
+        return this.getString(record['cot_id'])
+            ?? this.getString(record['reasoning_opaque'])
+            ?? this.getString(record['reasoning_signature'])
+            ?? this.getString(record['signature']);
+    }
+
+    private isRecoverablePartialStreamError(error: unknown): boolean {
+        const record = this.getRecord(error);
+        const message = String(record?.['message'] ?? error ?? '').toLowerCase();
+        const code = String(record?.['code'] ?? '').toLowerCase();
+        return code === 'err_stream_premature_close'
+            || message.includes('unexpected end')
+            || message.includes('unterminated')
+            || message.includes('premature close')
+            || message.includes('terminated')
+            || (message.includes('json') && message.includes('parse'));
+    }
+
+    private normalizeToolDefinitions(tools: ToolDefinition[] | undefined): ToolDefinition[] | undefined {
+        if (!tools || tools.length === 0) {
+            return undefined;
+        }
+        return tools.map(tool => ({
+            ...tool,
+            function: {
+                ...tool.function,
+                parameters: tool.function.parameters ?? { type: 'object', properties: {} }
+            }
+        }));
+    }
+
+    private getToolCallsFromRecord(record: Record<string, unknown> | undefined): unknown[] | undefined {
+        if (!record) {
+            return undefined;
+        }
+        for (const key of ['tool_calls', 'toolCalls']) {
+            const value = record[key];
+            if (Array.isArray(value) && value.length > 0) {
+                return value;
+            }
+        }
+        return undefined;
+    }
+
+    private updateChatToolCallFromRaw(
+        rawToolCall: unknown,
+        fallbackIndex: number,
+        toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }>,
+        appendArguments: boolean
+    ): { index: number; toolCall: { id: string; name: string; arguments: string } } | undefined {
+        const record = this.getRecord(rawToolCall);
+        if (!record) {
+            return undefined;
+        }
+
+        const indexValue = this.getFiniteNumber(record['index']);
+        const index = indexValue !== undefined ? indexValue : fallbackIndex;
+        const functionRecord = this.getRecord(record['function']) ?? this.getRecord(record['function_call']) ?? record;
+        const id = this.getString(record['id']) ?? this.getString(record['tool_call_id']) ?? this.getString(record['call_id']);
+        const name = this.getString(functionRecord['name']) ?? this.getString(record['name']);
+        const argumentsValue = typeof functionRecord['arguments'] === 'string'
+            ? functionRecord['arguments']
+            : typeof record['arguments'] === 'string'
+                ? record['arguments']
+                : undefined;
+
+        let toolCall = toolCallsInProgress.get(index);
+        if (!toolCall) {
+            toolCall = {
+                id: id ?? '',
+                name: name ?? '',
+                arguments: ''
+            };
+            toolCallsInProgress.set(index, toolCall);
+        }
+
+        if (id) {
+            toolCall.id = id;
+        }
+        if (name) {
+            toolCall.name = name;
+        }
+        if (argumentsValue !== undefined) {
+            toolCall.arguments = appendArguments ? toolCall.arguments + argumentsValue : argumentsValue;
+        }
+
+        return { index, toolCall };
     }
 
     private getRecord(value: unknown): Record<string, unknown> | undefined {
@@ -713,7 +839,11 @@ export class OpenAIClient {
         }
 
         const metadata: Record<string, unknown> = {};
-        for (const key of ['reasoning_details', 'thinking_details', 'reasoning_signature', 'signature']) {
+        const thinkingId = this.getThinkingIdFromRecord(record);
+        if (thinkingId) {
+            metadata['id'] = thinkingId;
+        }
+        for (const key of ['cot_id', 'reasoning_opaque', 'reasoning_details', 'thinking_details', 'reasoning_signature', 'signature']) {
             if (record[key] !== undefined) {
                 metadata[key] = record[key];
             }
@@ -915,6 +1045,41 @@ export class OpenAIClient {
         // Convert to OpenAI message format
         const openaiMessages = this.convertMessagesToOpenAIFormat(messages);
 
+        const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
+        const startedToolCallIndexes = new Set<number>();
+        let chunkCount = 0;
+        let finishReason: string | null = null;
+        let streamUsage: OpenAIUsage | undefined;
+        let responseMetadata: OpenAIResponseMetadata = {};
+
+        const emitStartedToolCall = (index: number, toolCall: { id: string; name: string; arguments: string }) => {
+            if (!toolCall.name || startedToolCallIndexes.has(index)) {
+                return;
+            }
+            startedToolCallIndexes.add(index);
+            streamOptions.onToolCallStarted?.({
+                id: toolCall.id || undefined,
+                name: toolCall.name
+            });
+        };
+
+        const collectCompletedToolCalls = (): CompletedToolCall[] => {
+            const completed: CompletedToolCall[] = [];
+            const seenIds = new Set<string>();
+            const sortedEntries = Array.from(toolCallsInProgress.entries()).sort((a, b) => a[0] - b[0]);
+            for (const [, toolCall] of sortedEntries) {
+                if (toolCall.id && toolCall.name && !seenIds.has(toolCall.id)) {
+                    seenIds.add(toolCall.id);
+                    completed.push({
+                        id: toolCall.id,
+                        name: toolCall.name,
+                        arguments: toolCall.arguments
+                    });
+                }
+            }
+            return completed;
+        };
+
         try {
             const maxTokens = (typeof streamOptions.maxTokens === 'number' && streamOptions.maxTokens > 0)
                 ? streamOptions.maxTokens
@@ -939,22 +1104,15 @@ export class OpenAIClient {
             this.applyOpenAICompatibleRequestExtras(requestOptions, requestOptionsFromCaller);
 
             // Add tools if provided
-            if (streamOptions.tools && streamOptions.tools.length > 0) {
-                requestOptions.tools = streamOptions.tools;
+            const normalizedTools = this.normalizeToolDefinitions(streamOptions.tools);
+            if (normalizedTools && normalizedTools.length > 0) {
+                requestOptions.tools = normalizedTools;
                 if (streamOptions.toolChoice) {
                     requestOptions.tool_choice = streamOptions.toolChoice;
                 }
             }
 
             const stream = await this.client.chat.completions.create(requestOptions);
-
-            // Track tool calls being assembled from streamed chunks
-            const toolCallsInProgress: Map<number, { id: string; name: string; arguments: string }> = new Map();
-
-            let chunkCount = 0;
-            let finishReason: string | null = null;
-            let streamUsage: OpenAIUsage | undefined;
-            let responseMetadata: OpenAIResponseMetadata = {};
 
             for await (const chunk of stream) {
                 chunkCount++;
@@ -972,6 +1130,7 @@ export class OpenAIClient {
                 }
 
                 const choice0 = chunk.choices[0];
+                const choiceAny = choice0 as unknown as Record<string, unknown> | undefined;
                 finishReason = (choice0 as any)?.finish_reason ?? finishReason;
                 const delta = choice0?.delta;
 
@@ -988,8 +1147,7 @@ export class OpenAIClient {
                     thinkTagParser.ingest(messageRefusal);
                 }
 
-                const messageReasoningRaw = (messageAny as any)?.reasoning_content ?? (messageAny as any)?.reasoning ?? (messageAny as any)?.thinking;
-                const messageReasoning = this.coerceThinkingText(messageReasoningRaw);
+                const messageReasoning = this.getThinkingTextFromRecord(messageAny);
                 if (messageReasoning && messageReasoning.length > 0) {
                     sawAnyModelOutput = true;
                     if (!streamOptions.suppressChainOfThought) {
@@ -999,29 +1157,40 @@ export class OpenAIClient {
                     }
                 }
 
-                const messageToolCalls = messageAny?.tool_calls;
+                const messageToolCalls = this.getToolCallsFromRecord(messageAny);
                 if (Array.isArray(messageToolCalls) && messageToolCalls.length > 0) {
                     sawAnyModelOutput = true;
                     for (let i = 0; i < messageToolCalls.length; i++) {
-                        const tc: any = messageToolCalls[i];
-                        const index = i;
-                        let toolCall = toolCallsInProgress.get(index);
-                        if (!toolCall) {
-                            toolCall = {
-                                id: tc?.id || '',
-                                name: tc?.function?.name || '',
-                                arguments: ''
-                            };
-                            toolCallsInProgress.set(index, toolCall);
+                        const updated = this.updateChatToolCallFromRaw(messageToolCalls[i], i, toolCallsInProgress, false);
+                        if (!updated) {
+                            continue;
                         }
-                        if (tc?.id) {
-                            toolCall.id = tc.id;
+                        emitStartedToolCall(updated.index, updated.toolCall);
+                        if (streamOptions.onToolCall && updated.toolCall.name) {
+                            streamOptions.onToolCall({
+                                id: updated.toolCall.id,
+                                name: updated.toolCall.name,
+                                arguments: updated.toolCall.arguments
+                            });
                         }
-                        if (tc?.function?.name) {
-                            toolCall.name = tc.function.name;
+                    }
+                }
+
+                const choiceToolCalls = this.getToolCallsFromRecord(choiceAny);
+                if (choiceToolCalls && choiceToolCalls.length > 0) {
+                    sawAnyModelOutput = true;
+                    for (let i = 0; i < choiceToolCalls.length; i++) {
+                        const updated = this.updateChatToolCallFromRaw(choiceToolCalls[i], i, toolCallsInProgress, false);
+                        if (!updated) {
+                            continue;
                         }
-                        if (typeof tc?.function?.arguments === 'string') {
-                            toolCall.arguments = tc.function.arguments;
+                        emitStartedToolCall(updated.index, updated.toolCall);
+                        if (streamOptions.onToolCall && updated.toolCall.name) {
+                            streamOptions.onToolCall({
+                                id: updated.toolCall.id,
+                                name: updated.toolCall.name,
+                                arguments: updated.toolCall.arguments
+                            });
                         }
                     }
                 }
@@ -1029,8 +1198,7 @@ export class OpenAIClient {
                 // Handle thinking/reasoning content (chain-of-thought)
                 // Some models (e.g., DeepSeek) return reasoning in a separate `reasoning_content` field
                 const deltaAny = delta as Record<string, unknown> | undefined;
-                const reasoningRaw = (deltaAny as any)?.reasoning_content ?? (deltaAny as any)?.reasoning ?? (deltaAny as any)?.thinking;
-                const reasoningContent = this.coerceThinkingText(reasoningRaw);
+                const reasoningContent = this.getThinkingTextFromRecord(deltaAny);
                 if (reasoningContent && reasoningContent.length > 0) {
                     sawAnyModelOutput = true;
                     if (!streamOptions.suppressChainOfThought) {
@@ -1055,41 +1223,24 @@ export class OpenAIClient {
                 }
 
                 // Handle tool calls in streaming response
-                if (delta?.tool_calls) {
-                    if (delta.tool_calls.length > 0) {
+                const deltaToolCalls = this.getToolCallsFromRecord(deltaAny);
+                if (deltaToolCalls) {
+                    if (deltaToolCalls.length > 0) {
                         sawAnyModelOutput = true;
                     }
-                    for (const toolCallDelta of delta.tool_calls) {
-                        const index = toolCallDelta.index;
-
-                        // Get or create the tool call being assembled
-                        let toolCall = toolCallsInProgress.get(index);
-                        if (!toolCall) {
-                            toolCall = {
-                                id: toolCallDelta.id || '',
-                                name: toolCallDelta.function?.name || '',
-                                arguments: ''
-                            };
-                            toolCallsInProgress.set(index, toolCall);
+                    for (let i = 0; i < deltaToolCalls.length; i++) {
+                        const updated = this.updateChatToolCallFromRaw(deltaToolCalls[i], i, toolCallsInProgress, true);
+                        if (!updated) {
+                            continue;
                         }
-
-                        // Update with new data from this chunk
-                        if (toolCallDelta.id) {
-                            toolCall.id = toolCallDelta.id;
-                        }
-                        if (toolCallDelta.function?.name) {
-                            toolCall.name = toolCallDelta.function.name;
-                        }
-                        if (toolCallDelta.function?.arguments) {
-                            toolCall.arguments += toolCallDelta.function.arguments;
-                        }
+                        emitStartedToolCall(updated.index, updated.toolCall);
 
                         // Legacy: Report incremental updates if onToolCall is provided
                         if (streamOptions.onToolCall) {
                             streamOptions.onToolCall({
-                                id: toolCall.id,
-                                name: toolCall.name,
-                                arguments: toolCall.arguments
+                                id: updated.toolCall.id,
+                                name: updated.toolCall.name,
+                                arguments: updated.toolCall.arguments
                             });
                         }
                     }
@@ -1126,23 +1277,7 @@ export class OpenAIClient {
             // Report all completed tool calls at once after streaming is done.
             // NOTE: if tool calls were already flushed during streaming (finish_reason === 'tool_calls'),
             // toolCallsInProgress has been cleared and this block is a no-op.
-            const completedToolCalls: CompletedToolCall[] = [];
-            if (toolCallsInProgress.size > 0) {
-                const seenIds = new Set<string>();
-                // Sort by index to maintain order
-                const sortedEntries = Array.from(toolCallsInProgress.entries()).sort((a, b) => a[0] - b[0]);
-                for (const [, toolCall] of sortedEntries) {
-                    // Deduplicate by tool call ID to prevent duplicate reporting
-                    if (toolCall.id && toolCall.name && !seenIds.has(toolCall.id)) {
-                        seenIds.add(toolCall.id);
-                        completedToolCalls.push({
-                            id: toolCall.id,
-                            name: toolCall.name,
-                            arguments: toolCall.arguments
-                        });
-                    }
-                }
-            }
+            const completedToolCalls = collectCompletedToolCalls();
             if (streamOptions.onToolCallsComplete && completedToolCalls.length > 0) {
                 streamOptions.onToolCallsComplete(completedToolCalls);
             }
@@ -1162,7 +1297,7 @@ export class OpenAIClient {
                     temperature: requestOptionsFromCaller.temperature ?? 0.7,
                     max_tokens: maxTokens,
                     stream: false,
-                    ...(streamOptions.tools && streamOptions.tools.length > 0 ? { tools: streamOptions.tools } : {}),
+                    ...(normalizedTools && normalizedTools.length > 0 ? { tools: normalizedTools } : {}),
                     ...(streamOptions.toolChoice ? { tool_choice: streamOptions.toolChoice } : {})
                 };
                 if (requestOptionsFromCaller.topP !== undefined) {
@@ -1196,8 +1331,7 @@ export class OpenAIClient {
                     thinkTagParser.ingest(nonStreamRefusal);
                 }
 
-                const nonStreamReasoningRaw = msgAny?.reasoning_content ?? msgAny?.reasoning ?? msgAny?.thinking;
-                const nonStreamReasoning = this.coerceThinkingText(nonStreamReasoningRaw);
+                const nonStreamReasoning = this.getThinkingTextFromRecord(msgAny);
                 if (nonStreamReasoning && nonStreamReasoning.length > 0) {
                     sawAnyModelOutput = true;
                     if (!streamOptions.suppressChainOfThought) {
@@ -1239,6 +1373,28 @@ export class OpenAIClient {
             const err = error as Record<string, unknown>;
             if (err?.name === 'AbortError' || streamOptions.signal?.aborted) {
                 thinkTagParser.flush();
+                return fullContent;
+            }
+
+            if ((sawAnyModelOutput || toolCallsInProgress.size > 0) && this.isRecoverablePartialStreamError(error)) {
+                logger.warn('Recoverable partial streaming response detected; returning accumulated output', 'OpenAI');
+                logger.debug('Partial streaming response details', {
+                    model,
+                    chunkCount,
+                    finishReason,
+                    message: err?.message
+                }, 'OpenAI');
+                thinkTagParser.flush();
+                const recoveredToolCalls = collectCompletedToolCalls();
+                if (streamOptions.onToolCallsComplete && recoveredToolCalls.length > 0) {
+                    streamOptions.onToolCallsComplete(recoveredToolCalls);
+                }
+                if (streamUsage && streamOptions.onUsage) {
+                    streamOptions.onUsage(streamUsage);
+                }
+                if (Object.keys(responseMetadata).length > 0) {
+                    streamOptions.onResponseMetadata?.(responseMetadata);
+                }
                 return fullContent;
             }
 
@@ -1317,6 +1473,7 @@ export class OpenAIClient {
 
         const toolCallsById = new Map<string, { id: string; name: string; arguments: string }>();
         const itemIdToCallId = new Map<string, string>();
+        const startedResponsesToolCallIds = new Set<string>();
         const textDeltaItemIds = new Set<string>();
         const refusalDeltaItemIds = new Set<string>();
         const reasoningDeltaItemIds = new Set<string>();
@@ -1364,6 +1521,14 @@ export class OpenAIClient {
             }
             if (typeof item.arguments === 'string') {
                 toolCall.arguments = item.arguments;
+            }
+
+            if (toolCall.name && !startedResponsesToolCallIds.has(toolCall.id)) {
+                startedResponsesToolCallIds.add(toolCall.id);
+                streamOptions.onToolCallStarted?.({
+                    id: toolCall.id,
+                    name: toolCall.name
+                });
             }
 
             if (streamOptions.onToolCall && toolCall.name) {
@@ -1602,6 +1767,26 @@ export class OpenAIClient {
                 return fullContent;
             }
 
+            if ((sawAnyModelOutput || toolCallsById.size > 0) && this.isRecoverablePartialStreamError(error)) {
+                logger.warn('Recoverable partial responses stream detected; returning accumulated output', 'OpenAI');
+                logger.debug('Partial responses stream details', {
+                    model,
+                    chunkCount,
+                    message: err?.message
+                }, 'OpenAI');
+                thinkTagParser.flush();
+                const recoveredToolCalls: CompletedToolCall[] = Array.from(toolCallsById.values())
+                    .filter(tc => tc.id && tc.name)
+                    .map(tc => ({ id: tc.id, name: tc.name, arguments: tc.arguments }));
+                if (streamOptions.onToolCallsComplete && recoveredToolCalls.length > 0) {
+                    streamOptions.onToolCallsComplete(recoveredToolCalls);
+                }
+                if (Object.keys(responseMetadata).length > 0) {
+                    streamOptions.onResponseMetadata?.(responseMetadata);
+                }
+                return fullContent;
+            }
+
             logger.error('streamResponsesCompletion failed', error, 'OpenAI');
             logger.debug('streamResponsesCompletion error details', {
                 model,
@@ -1743,6 +1928,7 @@ export class OpenAIClient {
                         content: this.toUserMessageContent(msg.content)
                     };
                 case 'assistant':
+                    const reasoningFields = this.buildAssistantReasoningFields(msg);
                     // Assistant messages can have tool_calls
                     if (msg.tool_calls && msg.tool_calls.length > 0) {
                         // Filter out tool calls without valid IDs to prevent API errors
@@ -1760,14 +1946,16 @@ export class OpenAIClient {
                                         name: tc.function.name,
                                         arguments: tc.function.arguments
                                     }
-                                }))
-                            };
+                                })),
+                                ...reasoningFields
+                            } as OpenAI.Chat.ChatCompletionMessageParam;
                         }
                     }
                     return {
                         role: 'assistant' as const,
-                        content: textContent
-                    };
+                        content: textContent || null,
+                        ...reasoningFields
+                    } as OpenAI.Chat.ChatCompletionMessageParam;
                 case 'tool':
                     // Tool messages must have content (not null) and a valid tool_call_id
                     // Some APIs (e.g., Claude via OpenAI-compatible proxies) require non-empty tool_call_id
@@ -1792,6 +1980,28 @@ export class OpenAIClient {
                     };
             }
         });
+    }
+
+    private buildAssistantReasoningFields(msg: ChatMessage): Record<string, unknown> {
+        const reasoningText = msg.reasoning_content
+            ?? msg.reasoning_text
+            ?? msg.cot_summary
+            ?? msg.reasoning
+            ?? msg.thinking;
+        if (!reasoningText) {
+            return {};
+        }
+
+        const reasoningId = msg.cot_id ?? msg.reasoning_opaque ?? msg.signature;
+        return {
+            ...(reasoningId ? { cot_id: reasoningId } : {}),
+            cot_summary: reasoningText,
+            reasoning_content: reasoningText,
+            reasoning: reasoningText,
+            ...(msg.reasoning_text ? { reasoning_text: msg.reasoning_text } : {}),
+            ...(msg.reasoning_opaque ? { reasoning_opaque: msg.reasoning_opaque } : {}),
+            ...(msg.signature ? { signature: msg.signature } : {})
+        };
     }
 
     private contentToText(content: ChatMessageContent): string {
