@@ -312,7 +312,7 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
                 },
                 onThinkingChunk: (chunk) => {
                     if (!suppressChainOfThought) {
-                        progress.report(new vscode.LanguageModelThinkingPart(chunk));
+                        this.tryReportThinkingPart(chunk, undefined, undefined, progress);
                     }
                 },
                 suppressChainOfThought,
@@ -367,6 +367,17 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
             if (nonToolCallText) {
                 progress.report(new vscode.LanguageModelTextPart(nonToolCallText));
             }
+        }
+    }
+
+    private tryReportThinkingPart(
+        value: string,
+        id: string | undefined,
+        metadata: Record<string, unknown> | undefined,
+        progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
+    ): void {
+        if (typeof vscode.LanguageModelThinkingPart === 'function') {
+            progress.report(new vscode.LanguageModelThinkingPart(value, id, metadata));
         }
     }
 

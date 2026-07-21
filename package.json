@@ -10,21 +10,19 @@
   },
   "icon": "assets/LOGO.png",
   "engines": {
-    "vscode": "^1.107.0",
+    "vscode": "^1.125.0",
     "node": ">=18.0.0",
     "pnpm": ">=10.0.0"
   },
-  "enabledApiProposals": [
-    "chatProvider",
-    "languageModelPricing",
-    "languageModelThinkingPart"
-  ],
   "categories": [
     "AI",
     "Chat"
   ],
   "activationEvents": [
-    "*"
+    "onStartupFinished",
+    "onLanguageModelChatProvider:oai2lmapi",
+    "onLanguageModelChatProvider:gemini2lmapi",
+    "onLanguageModelChatProvider:claude2lmapi"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -293,7 +291,7 @@
     "@types/glob": "^9.0.0",
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.2.0",
-    "@types/vscode": "1.107.0",
+    "@types/vscode": "1.125.0",
     "@typescript-eslint/eslint-plugin": "^8.54.0",
     "@typescript-eslint/parser": "^8.54.0",
     "@vscode/test-electron": "^2.5.2",

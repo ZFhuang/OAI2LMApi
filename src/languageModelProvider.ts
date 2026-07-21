@@ -718,8 +718,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
                     }
                 },
                 onThinkingChunk: (chunk, metadata) => {
-                    // Report thinking/reasoning content using LanguageModelThinkingPart
-                    progress.report(new vscode.LanguageModelThinkingPart(chunk, this.getThinkingIdFromMetadata(metadata), metadata));
+                    this.tryReportThinkingPart(chunk, this.getThinkingIdFromMetadata(metadata), metadata, progress);
                 },
                 onToolCallStarted: (toolCall) => {
                     logger.debug(`Streaming native tool call started: ${toolCall.name}`, {
@@ -1260,7 +1259,18 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
     }
 
     private isThinkingPart(part: unknown): part is { value: string | string[]; id?: string; metadata?: Record<string, unknown> } {
-        return part instanceof vscode.LanguageModelThinkingPart;
+        return typeof vscode.LanguageModelThinkingPart === 'function' && part instanceof vscode.LanguageModelThinkingPart;
+    }
+
+    private tryReportThinkingPart(
+        value: string,
+        id: string | undefined,
+        metadata: Record<string, unknown> | undefined,
+        progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
+    ): void {
+        if (typeof vscode.LanguageModelThinkingPart === 'function') {
+            progress.report(new vscode.LanguageModelThinkingPart(value, id, metadata));
+        }
     }
 
     private extractThinkingContent(part: { value: string | string[] }): string {

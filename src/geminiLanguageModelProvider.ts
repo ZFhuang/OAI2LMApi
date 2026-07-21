@@ -934,7 +934,7 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
                     reasoningSignatures.set(part.id, thoughtSignature);
                 }
                 if (part.delta) {
-                    progress.report(new vscode.LanguageModelThinkingPart(part.delta));
+                    this.tryReportThinkingPart(part.delta, undefined, undefined, progress);
                 }
                 return;
             }
@@ -943,7 +943,7 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
                 const signature = reasoningSignatures.get(part.id) ?? this.getThoughtSignature(part.providerMetadata);
                 reasoningSignatures.delete(part.id);
                 if (signature) {
-                    progress.report(new vscode.LanguageModelThinkingPart('', undefined, { thoughtSignature: signature }));
+                    this.tryReportThinkingPart('', undefined, { thoughtSignature: signature }, progress);
                 }
                 return;
             }
@@ -977,6 +977,17 @@ export class GeminiLanguageModelProvider implements vscode.LanguageModelChatProv
 
             default:
                 return;
+        }
+    }
+
+    private tryReportThinkingPart(
+        value: string,
+        id: string | undefined,
+        metadata: Record<string, unknown> | undefined,
+        progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
+    ): void {
+        if (typeof vscode.LanguageModelThinkingPart === 'function') {
+            progress.report(new vscode.LanguageModelThinkingPart(value, id, metadata));
         }
     }
 

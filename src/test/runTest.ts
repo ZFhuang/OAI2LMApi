@@ -15,7 +15,7 @@ async function main() {
 		await runTests({ 
 			extensionDevelopmentPath, 
 			extensionTestsPath,
-			version: '1.107.0'
+			version: '1.125.0'
 		});
 	} catch (err) {
 		console.error('Failed to run tests:', err);
