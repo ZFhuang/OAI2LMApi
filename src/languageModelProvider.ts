@@ -589,7 +589,27 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         token: vscode.CancellationToken
     ): Promise<ModelInformation[]> {
         logger.debug(`Providing ${this.modelList.length} models to VSCode`, undefined, 'OpenAI');
-        return this.modelList;
+        // Surface only stable LanguageModelChatInformation fields plus our own
+        // `modelId`. Proposed `chatProvider` fields (pricing, configurationSchema,
+        // isBYOK, multiplierNumeric, supportedParameters, supportsReasoning, etc.)
+        // stay on the internal objects for our own use but must not be returned
+        // here, otherwise VS Code gates the provider behind the `chatProvider`
+        // proposed API and refuses to register models.
+        return this.modelList.map(model => ({
+            id: model.id,
+            modelId: model.modelId,
+            name: model.name,
+            family: model.family,
+            version: model.version,
+            maxInputTokens: model.maxInputTokens,
+            maxOutputTokens: model.maxOutputTokens,
+            ...(model.tooltip ? { tooltip: model.tooltip } : {}),
+            ...(model.detail ? { detail: model.detail } : {}),
+            capabilities: {
+                toolCalling: typeof model.capabilities?.toolCalling === 'boolean' ? model.capabilities.toolCalling : Boolean(model.capabilities?.toolCalling),
+                imageInput: typeof model.capabilities?.imageInput === 'boolean' ? model.capabilities.imageInput : Boolean(model.capabilities?.imageInput)
+            }
+        }));
     }
 
     async provideLanguageModelChatResponse(
@@ -603,8 +623,15 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
             throw new Error('OpenAI client not initialized');
         }
 
+        // VS Code passes back the stable-only object we returned from
+        // provideLanguageModelChatInformation, which omits proposed chatProvider
+        // fields (supportsReasoning, defaultParameters, reasoningEffortFormat,
+        // etc.). Resolve the full internal model entry by modelId so request
+        // option building still has access to those fields.
+        const internalModel = this.modelList.find(m => m.modelId === model.modelId) ?? model;
+
         // Check if prompt-based tool calling is enabled for this model
-        const modelOverride = getModelOverride(model.modelId, 'openai');
+        const modelOverride = getModelOverride(internalModel.modelId, 'openai');
         const usePromptBasedToolCalling = modelOverride?.usePromptBasedToolCalling === true;
 
         // Determine whether to use the OpenAI Responses API for this model
@@ -671,7 +698,7 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         const modelBudget = typeof model.maxOutputTokens === 'number' && Number.isFinite(model.maxOutputTokens) ? model.maxOutputTokens : 2048;
         // Cap to avoid proxies rejecting very large max_tokens.
         const maxTokens = Math.max(1, Math.min(budgetNumber ?? modelBudget, 8192));
-        const requestOptions = this.buildRequestOptions(model, options, modelOverride);
+        const requestOptions = this.buildRequestOptions(internalModel, options, modelOverride);
 
         // Create abort controller from cancellation token
         const abortController = new AbortController();
@@ -1259,7 +1286,9 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
     }
 
     private isThinkingPart(part: unknown): part is { value: string | string[]; id?: string; metadata?: Record<string, unknown> } {
-        return typeof vscode.LanguageModelThinkingPart === 'function' && part instanceof vscode.LanguageModelThinkingPart;
+        return typeof part === 'object'
+            && part !== null
+            && (part as { constructor?: { name?: string } }).constructor?.name === 'LanguageModelThinkingPart';
     }
 
     private tryReportThinkingPart(
@@ -1268,9 +1297,10 @@ export class OpenAILanguageModelProvider implements vscode.LanguageModelChatProv
         metadata: Record<string, unknown> | undefined,
         progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
     ): void {
-        if (typeof vscode.LanguageModelThinkingPart === 'function') {
-            progress.report(new vscode.LanguageModelThinkingPart(value, id, metadata));
-        }
+        void value;
+        void id;
+        void metadata;
+        void progress;
     }
 
     private extractThinkingContent(part: { value: string | string[] }): string {

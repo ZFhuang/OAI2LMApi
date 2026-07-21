@@ -205,7 +205,23 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
         token: vscode.CancellationToken
     ): Promise<ClaudeModelInformation[]> {
         logger.debug(`Providing ${this.modelList.length} models to VSCode`, undefined, 'Claude');
-        return this.modelList;
+        // Surface only stable fields plus our own modelId; see OpenAI provider
+        // for the rationale on not surfacing proposed chatProvider fields.
+        return this.modelList.map(model => ({
+            id: model.id,
+            modelId: model.modelId,
+            name: model.name,
+            family: model.family,
+            version: model.version,
+            maxInputTokens: model.maxInputTokens,
+            maxOutputTokens: model.maxOutputTokens,
+            ...(model.tooltip ? { tooltip: model.tooltip } : {}),
+            ...(model.detail ? { detail: model.detail } : {}),
+            capabilities: {
+                toolCalling: typeof model.capabilities?.toolCalling === 'boolean' ? model.capabilities.toolCalling : Boolean(model.capabilities?.toolCalling),
+                imageInput: typeof model.capabilities?.imageInput === 'boolean' ? model.capabilities.imageInput : Boolean(model.capabilities?.imageInput)
+            }
+        }));
     }
 
     async provideLanguageModelChatResponse(
@@ -376,9 +392,10 @@ export class ClaudeLanguageModelProvider implements vscode.LanguageModelChatProv
         metadata: Record<string, unknown> | undefined,
         progress: vscode.Progress<vscode.LanguageModelTextPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelDataPart | vscode.LanguageModelThinkingPart>
     ): void {
-        if (typeof vscode.LanguageModelThinkingPart === 'function') {
-            progress.report(new vscode.LanguageModelThinkingPart(value, id, metadata));
-        }
+        void value;
+        void id;
+        void metadata;
+        void progress;
     }
 
     private convertTools(tools: readonly vscode.LanguageModelChatTool[] | undefined): ClaudeToolDefinition[] | undefined {

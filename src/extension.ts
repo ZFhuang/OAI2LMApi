@@ -198,11 +198,61 @@ async function initializeAsync(context: vscode.ExtensionContext): Promise<void> 
 
         // Create and register the Claude language model provider
         await initializeClaudeProvider(context);
+
+        // VS Code 1.128+ defaults `chat.byokUtilityModelDefault` to "none", which
+        // breaks background utility tasks (title generation, commit messages,
+        // intent detection) when a BYOK model is selected as the main agent.
+        // Auto-fix it once so those tasks use the main agent model.
+        checkUtilityModelConfiguration(context);
     } catch (error) {
         logger.error('Background initialization failed', error, 'Extension');
         // Surface critical initialization failures to the user
         vscode.window.showErrorMessage('OAI2LMApi: Background initialization failed. Check the Output panel for details.');
     }
+}
+
+/**
+ * VS Code 1.128 introduced `chat.byokUtilityModelDefault` with a default of "none",
+ * which breaks all background utility tasks for BYOK users. This auto-configures it
+ * to "mainAgent" on first activation so background tasks continue to work.
+ *
+ * Rules:
+ * - Only runs on VS Code 1.128+.
+ * - Skips if any utility model setting is already explicitly configured.
+ * - Uses a one-time globalState flag to avoid showing the notification repeatedly.
+ */
+function checkUtilityModelConfiguration(context: vscode.ExtensionContext): void {
+    const [major, minor] = vscode.version.split('.').map(Number);
+    if (major < 1 || (major === 1 && minor < 128)) {
+        return;
+    }
+
+    const chat = vscode.workspace.getConfiguration('chat');
+    const byokDefault = chat.get<string>('byokUtilityModelDefault', '');
+    const utilitySmall = chat.get<string>('utilitySmallModel', '');
+    const utilityGeneral = chat.get<string>('utilityModel', '');
+
+    // Treat VS Code's schema default values as "not configured"
+    const isConfigured =
+        (byokDefault !== '' && byokDefault !== undefined && byokDefault !== 'none')
+        || (utilitySmall !== '' && utilitySmall !== undefined && utilitySmall !== 'Default')
+        || (utilityGeneral !== '' && utilityGeneral !== undefined && utilityGeneral !== 'Default');
+    if (isConfigured) {
+        return;
+    }
+
+    const noticeKey = 'oai2lmapi.utilityModelAutoFixed.v1128';
+    void chat.update('byokUtilityModelDefault', 'mainAgent', vscode.ConfigurationTarget.Global)
+        .then(() => {
+            if (context.globalState.get<boolean>(noticeKey)) {
+                return;
+            }
+            void context.globalState.update(noticeKey, true);
+            void vscode.window.showInformationMessage(
+                'OAI2LMApi: Automatically configured VS Code utility model setting. '
+                + 'Background tasks (chat titles, commit messages) now use your selected model.'
+            );
+        });
 }
 
 async function migrateApiKeyToSecretStorage(context: vscode.ExtensionContext): Promise<void> {
